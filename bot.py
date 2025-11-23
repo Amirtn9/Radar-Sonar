@@ -1981,48 +1981,45 @@ async def set_custom_interval_action(update: Update, context: ContextTypes.DEFAU
     return GET_CUSTOM_INTERVAL
 
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "📝 یک پیام از کانال مورد نظر **فوروارد** کنید:", reply_markup=get_cancel_markup())
+    await safe_edit_message(
+        update, 
+        "📝 **افزودن کانال جدید**\n\n"
+        "لطفاً **آیدی عددی کانال** را ارسال کنید.\n"
+        "مثال: `-100123456789`\n\n"
+        "⚠️ **نکته:** ابتدا ربات را در کانال **ادمین** کنید.", 
+        reply_markup=get_cancel_markup()
+    )
     return GET_CHANNEL_FORWARD
 
 async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message
-        if not msg:
-            return
+        text = getattr(msg, 'text', '').strip()
+        
+        # اعتبارسنجی: آیدی باید با -100 شروع شود یا @ داشته باشد
+        if not text or (not text.startswith('-100') and not text.startswith('@')):
+            await msg.reply_text(
+                "❌ **فرمت نامعتبر!**\n\n"
+                "لطفاً فقط **آیدی عددی** (شروع با -100) یا **یوزرنیم** (شروع با @) بفرستید.\n"
+                "مثال صحیح: `-100123456789`"
+            )
+            return GET_CHANNEL_FORWARD
 
-        c_id = None
+        c_id = text
         c_name = "Channel (Manual)"
         
-        # --- روش ۱: بررسی متن (اولویت با آیدی دستی) ---
-        # استفاده از getattr برای جلوگیری از ارور اگر متن وجود نداشت
-        text = getattr(msg, 'text', '')
-        if text and (text.startswith('-100') or text.startswith('@')):
-            c_id = text.strip()
-            # تلاش برای گرفتن اسم کانال
-            try:
-                chat = await context.bot.get_chat(c_id)
-                c_name = chat.title
-                c_id = str(chat.id)
-            except:
-                pass
-
-        # --- روش ۲: بررسی فوروارد (به روش ایمن) ---
-        # اگر آیدی دستی پیدا نشد، فوروارد را چک میکنیم
-        if not c_id:
-            # این خط جلوی ارور 'has no attribute' را می‌گیرد
-            fwd_chat = getattr(msg, 'forward_from_chat', None)
-            
-            if fwd_chat and fwd_chat.type == 'channel':
-                c_id = str(fwd_chat.id)
-                c_name = fwd_chat.title
-
-        # --- نتیجه‌گیری ---
-        if not c_id:
+        # تلاش برای گرفتن اسم کانال جهت اطمینان
+        try:
+            chat = await context.bot.get_chat(c_id)
+            c_name = chat.title
+            c_id = str(chat.id) # تبدیل نهایی به آیدی عددی
+        except Exception as e:
+            # اگر ربات ادمین نباشد یا آیدی غلط باشد
             await msg.reply_text(
-                "❌ **کانال شناسایی نشد!**\n\n"
-                "لطفاً **آیدی عددی کانال** را به صورت دقیق ارسال کنید.\n"
-                "مثال: `-100123456789`\n\n"
-                "(نکته: ربات باید در آن کانال ادمین باشد)"
+                f"❌ **ربات نتوانست کانال را پیدا کند!**\n\n"
+                f"1️⃣ مطمئن شوید آیدی `{text}` صحیح است.\n"
+                f"2️⃣ مطمئن شوید ربات در کانال **ادمین** است.\n"
+                f"خطا: {e}"
             )
             return GET_CHANNEL_FORWARD
 
@@ -2042,24 +2039,7 @@ async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         logger.error(f"Channel Add Error: {e}")
-        try:
-            await update.message.reply_text("❌ خطا در پردازش. لطفاً فقط آیدی عددی کانال (مثلا -100...) را بفرستید.")
-        except: pass
-        return GET_CHANNEL_FORWARD
-
-        context.user_data['new_chan'] = {'id': c_id, 'name': c_name}
-        
-        kb = [
-            [InlineKeyboardButton("🔥 فقط فشار منابع (CPU/RAM)", callback_data='type_resource')],
-            [InlineKeyboardButton("🚨 فقط هشدار قطعی", callback_data='type_down'), InlineKeyboardButton("⏳ فقط انقضا", callback_data='type_expiry')],
-            [InlineKeyboardButton("📊 فقط گزارشات", callback_data='type_report'), InlineKeyboardButton("✅ همه موارد", callback_data='type_all')]
-        ]
-        await update.message.reply_text(f"✅ کانال **{c_name}** شناسایی شد.\n🆔 آیدی: `{c_id}`\n\n🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", reply_markup=InlineKeyboardMarkup(kb))
-        return GET_CHANNEL_TYPE
-
-    except Exception as e:
-        logger.error(f"Channel Add Error: {e}")
-        await update.message.reply_text(f"❌ خطای غیرمنتظره: {e}\nلطفاً آیدی عددی کانال را دستی ارسال کنید.")
+        await msg.reply_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
         return GET_CHANNEL_FORWARD
 
 async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
