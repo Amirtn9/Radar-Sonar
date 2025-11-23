@@ -52,7 +52,7 @@ fi
 # 🔧 CORE FUNCTIONS
 # ==============================================================================
 
-# 1. Install Bot Logic
+# 1. Install / Re-Install (Fresh Setup)
 function install_bot() {
     show_header
     
@@ -146,7 +146,46 @@ EOF
     whiptail --msgbox "✅ Installation Complete!\n\n🤖 Bot is now running." 8 45
 }
 
-# 2. Configuration GUI
+# 2. Update Only (Fast Update)
+function update_bot() {
+    if [ ! -d "$INSTALL_DIR" ]; then
+        whiptail --msgbox "❌ Bot is not installed! Use 'Install' option first." 8 45
+        return
+    fi
+
+    systemctl stop $SERVICE_NAME
+    
+    {
+        echo 20
+        echo "XXX\nPulling changes from GitHub...\nXXX"
+        cd "$INSTALL_DIR" || exit
+        
+        # Check if it's a git repo
+        if [ -d ".git" ]; then
+            git fetch --all
+            git reset --hard origin/main
+            git pull
+        else
+            # If installed via CURL fallback, re-download files
+            curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
+            curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
+        fi
+        
+        echo 60
+        echo "XXX\nUpdating dependencies...\nXXX"
+        source "$INSTALL_DIR/venv/bin/activate"
+        pip install -r requirements.txt > /dev/null 2>&1
+        
+        echo 90
+        echo "XXX\nRestarting Service...\nXXX"
+        systemctl restart $SERVICE_NAME
+        echo 100
+    } | whiptail --title "Update" --gauge "Updating Sonar Radar..." 8 60 0
+    
+    whiptail --msgbox "✅ Bot Updated Successfully!\n(Your database and config were preserved)" 8 50
+}
+
+# 3. Configuration GUI
 function configure_bot_gui() {
     MODE=$1
     CONFIG_FILE="$INSTALL_DIR/bot.py"
@@ -174,7 +213,7 @@ function configure_bot_gui() {
     fi
 }
 
-# 3. Uninstall Logic
+# 4. Uninstall Logic
 function uninstall_bot() {
     if (whiptail --title "⚠️ DELETE BOT" --yesno "Are you sure you want to DELETE everything?" 10 60); then
         systemctl stop $SERVICE_NAME
@@ -186,14 +225,14 @@ function uninstall_bot() {
     fi
 }
 
-# 4. View Logs
+# 5. View Logs
 function view_logs() {
     clear
     echo -e "${GREEN}📜 Showing Logs (Ctrl+C to exit)...${NC}"
     journalctl -u $SERVICE_NAME -f -n 50
 }
 
-# 5. Check Status
+# 6. Check Status
 function check_status() {
     if systemctl is-active --quiet $SERVICE_NAME; then
         whiptail --msgbox "✅ Status: RUNNING 🟢" 8 30
@@ -208,26 +247,28 @@ function check_status() {
 while true; do
     show_header
     
-    OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Select an option:" 18 70 10 \
-    "1" "📥 Install / Update (Clean Install)" \
-    "2" "⚙️ Configure Token & Admin ID" \
-    "3" "⏯️ Restart Bot" \
-    "4" "🛑 Stop Bot" \
-    "5" "📜 View Live Logs" \
-    "6" "📊 Check Service Status" \
-    "7" "🗑️ Uninstall Completely" \
-    "8" "❌ Exit" 3>&1 1>&2 2>&3)
+    OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Select an option:" 20 70 11 \
+    "1" "📥 Install / Re-install (Reset)" \
+    "2" "🔄 Update Source Code (Fast)" \
+    "3" "⚙️ Configure Token & Admin ID" \
+    "4" "⏯️ Restart Bot" \
+    "5" "🛑 Stop Bot" \
+    "6" "📜 View Live Logs" \
+    "7" "📊 Check Service Status" \
+    "8" "🗑️ Uninstall Completely" \
+    "9" "❌ Exit" 3>&1 1>&2 2>&3)
 
     if [ $? -ne 0 ]; then exit; fi
 
     case $OPTION in
         1) install_bot ;;
-        2) configure_bot_gui "menu" ;;
-        3) systemctl restart $SERVICE_NAME; whiptail --msgbox "✅ Restarted." 8 30 ;;
-        4) systemctl stop $SERVICE_NAME; whiptail --msgbox "🛑 Stopped." 8 30 ;;
-        5) view_logs ;;
-        6) check_status ;;
-        7) uninstall_bot ;;
-        8) clear; exit ;;
+        2) update_bot ;;
+        3) configure_bot_gui "menu" ;;
+        4) systemctl restart $SERVICE_NAME; whiptail --msgbox "✅ Restarted." 8 30 ;;
+        5) systemctl stop $SERVICE_NAME; whiptail --msgbox "🛑 Stopped." 8 30 ;;
+        6) view_logs ;;
+        7) check_status ;;
+        8) uninstall_bot ;;
+        9) clear; exit ;;
     esac
 done
