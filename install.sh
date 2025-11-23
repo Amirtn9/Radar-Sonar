@@ -10,89 +10,101 @@ SERVICE_NAME="sonar-bot"
 REPO_URL="https://github.com/Amirtn9/radar-sonar.git"
 RAW_URL="https://raw.githubusercontent.com/Amirtn9/radar-sonar/main"
 
-# --- Colors ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
+# --- Colors (Modern Palette) ---
+RESET='\033[0m'
+BOLD='\033[1m'
 CYAN='\033[0;36m'
-NC='\033[0m'
+BLUE='\033[0;34m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+PURPLE='\033[0;35m'
+BG_BLUE='\033[44m'
 
-# --- Header & Logo ---
-function show_header() {
+# --- Utils ---
+function print_title() {
     clear
-    echo -e "${PURPLE}"
+    echo -e "${PURPLE}${BOLD}"
     echo "      /\\                 /\\    "
     echo "     / \\'._   (\_/)   _.'/ \\   "
     echo "    /_.''._'--('.')--'_.''._\  "
     echo "    | \_ / \`  ~ ~  \`/ \_ / |  "
     echo "     \_/  \`/       \`'  \_/   "
     echo "           \`           \`      "
-    echo -e "${NC}"
-    echo -e "${CYAN}   🦇 SONAR RADAR ULTRA MONITOR 1.0 🦇${NC}"
-    echo -e "${BLUE} ==========================================${NC}"
-    sleep 0.3
+    echo -e "${RESET}"
+    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 1.0${RESET}"
+    echo -e "   ${BLUE}──────────────────────────────────${RESET}"
+    echo ""
+}
+
+function print_success() {
+    echo -e "${GREEN}${BOLD}✅ $1${RESET}"
+}
+
+function print_error() {
+    echo -e "${RED}${BOLD}❌ $1${RESET}"
+}
+
+function print_info() {
+    echo -e "${YELLOW}➤ $1...${RESET}"
+}
+
+function wait_enter() {
+    echo ""
+    read -p "Press [Enter] to continue..."
 }
 
 # --- Root Check ---
 if [ "$EUID" -ne 0 ]; then 
-  echo -e "${RED}❌ لطفا با دسترسی روت اجرا کنید (sudo).${NC}"
+  echo -e "${RED}❌ Please run as root.${RESET}"
   exit 1
 fi
 
-# --- Install Whiptail if missing ---
-if ! command -v whiptail &> /dev/null; then
-    echo -e "${YELLOW}📦 نصب ابزارهای گرافیکی...${NC}"
-    apt-get update -y > /dev/null 2>&1
-    apt-get install -y whiptail > /dev/null 2>&1
-fi
-
 # ==============================================================================
-# 🔧 FUNCTIONS
+# 🔧 CORE OPERATIONS
 # ==============================================================================
 
 function install_bot() {
-    if systemctl is-active --quiet $SERVICE_NAME; then systemctl stop $SERVICE_NAME; fi
+    print_title
+    echo -e "${BOLD}🚀 INSTALLATION STARTED...${RESET}\n"
+
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        systemctl stop $SERVICE_NAME
+    fi
+
+    print_info "Updating system repositories"
+    apt-get update -y > /dev/null 2>&1
+
+    print_info "Installing system dependencies"
+    apt-get install -y python3 python3-pip python3-venv git curl build-essential libssl-dev libffi-dev python3-dev > /dev/null 2>&1
+
+    print_info "Setting up directories"
+    # Backup
+    if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db; fi
+    if [ -f "$INSTALL_DIR/secret.key" ]; then cp "$INSTALL_DIR/secret.key" /tmp/sonar_secret.key; fi
     
-    {
-        echo 10; echo "XXX\n🔄 در حال آپدیت مخازن سیستم...\nXXX"
-        apt-get update -y > /dev/null 2>&1
-        
-        echo 30; echo "XXX\n📦 نصب پیش‌نیازهای پایتون و سیستم...\nXXX"
-        apt-get install -y python3 python3-pip python3-venv git curl build-essential libssl-dev libffi-dev python3-dev > /dev/null 2>&1
-        
-        echo 50; echo "XXX\n📂 آماده‌سازی دایرکتوری‌ها...\nXXX"
-        if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db; fi
-        if [ -f "$INSTALL_DIR/secret.key" ]; then cp "$INSTALL_DIR/secret.key" /tmp/sonar_secret.key; fi
-        rm -rf "$INSTALL_DIR"; mkdir -p "$INSTALL_DIR"
-        
-        echo 60; echo "XXX\n📥 دریافت فایل‌های ربات...\nXXX"
-        if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
-            curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
-            curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
-        fi
-        
-        # Restore Backups
-        if [ -f "/tmp/sonar_backup.db" ]; then mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"; fi
-        if [ -f "/tmp/sonar_secret.key" ]; then mv /tmp/sonar_secret.key "$INSTALL_DIR/secret.key"; fi
+    rm -rf "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
 
-        echo 80; echo "XXX\n🐍 ساخت محیط ایزوله (VirtualEnv)...\nXXX"
-        python3 -m venv "$INSTALL_DIR/venv"
-        source "$INSTALL_DIR/venv/bin/activate"
-        
-        echo 90; echo "XXX\n📚 نصب کتابخانه‌های مورد نیاز...\nXXX"
-        pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-        pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
-        
-        echo 100
-    } | whiptail --title "نصب ربات" --gauge "در حال نصب Sonar Radar..." 8 60 0
+    print_info "Downloading Sonar Radar source"
+    if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
+        curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
+        curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
+    fi
 
-    if [ ! -f "$INSTALL_DIR/bot.py" ]; then whiptail --msgbox "❌ خطا در دانلود فایل‌ها." 8 45; return; fi
+    # Restore
+    if [ -f "/tmp/sonar_backup.db" ]; then mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"; fi
+    if [ -f "/tmp/sonar_secret.key" ]; then mv /tmp/sonar_secret.key "$INSTALL_DIR/secret.key"; fi
 
-    configure_token_gui "install"
+    print_info "Creating Virtual Environment"
+    python3 -m venv "$INSTALL_DIR/venv"
+    source "$INSTALL_DIR/venv/bin/activate"
 
-    # Create Service
+    print_info "Installing Python libraries (This may take a while)"
+    pip install --upgrade pip setuptools wheel > /dev/null 2>&1
+    pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
+
+    # Service File
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Sonar Radar Ultra Pro Bot
@@ -112,72 +124,103 @@ EOF
 
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
+    
+    # Run Config if bot.py exists
+    if [ -f "$INSTALL_DIR/bot.py" ]; then
+        configure_token "install"
+    else
+        print_error "Download failed!"
+        wait_enter
+        return
+    fi
+
     systemctl restart $SERVICE_NAME
-    whiptail --msgbox "✅ نصب با موفقیت انجام شد!\n🦇 Sonar Radar فعال است." 8 45
+    print_success "Installation Complete! Bot is running."
+    wait_enter
 }
 
 function update_bot() {
-    if [ ! -d "$INSTALL_DIR" ]; then whiptail --msgbox "❌ ربات نصب نیست!" 8 45; return; fi
+    print_title
+    echo -e "${BOLD}🔄 SMART UPDATE STARTED...${RESET}\n"
     
+    if [ ! -d "$INSTALL_DIR" ]; then print_error "Bot is not installed."; wait_enter; return; fi
+
     systemctl stop $SERVICE_NAME
-    {
-        echo 20; echo "XXX\n📥 دریافت آخرین تغییرات از گیت‌هاب...\nXXX"
-        cd "$INSTALL_DIR" || exit
-        git fetch --all > /dev/null 2>&1
-        git reset --hard origin/main > /dev/null 2>&1
-        git pull > /dev/null 2>&1
-        
-        echo 60; echo "XXX\n♻️ آپدیت کتابخانه‌های پایتون...\nXXX"
-        if [ -d "venv" ]; then
-            source "venv/bin/activate"
-            pip install --upgrade "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
-        fi
-        
-        echo 90; echo "XXX\n🚀 استارت مجدد سرویس...\nXXX"
-        systemctl restart $SERVICE_NAME
-        echo 100
-    } | whiptail --title "بروزرسانی" --gauge "در حال آپدیت هوشمند..." 8 60 0
-    
-    whiptail --msgbox "✅ ربات و تمام فایل‌ها آپدیت شدند." 8 45
+
+    print_info "Pulling latest code from GitHub"
+    cd "$INSTALL_DIR" || exit
+    git fetch --all > /dev/null 2>&1
+    git reset --hard origin/main > /dev/null 2>&1
+    git pull > /dev/null 2>&1
+
+    print_info "Updating Python dependencies"
+    if [ -d "venv" ]; then
+        source "venv/bin/activate"
+        pip install --upgrade "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
+    fi
+
+    print_info "Restarting service"
+    systemctl restart $SERVICE_NAME
+
+    print_success "Update Finished Successfully."
+    wait_enter
 }
 
 function full_restart_bot() {
-    {
-        echo 10; echo "XXX\n🛑 توقف سرویس ربات...\nXXX"
-        systemctl stop $SERVICE_NAME
-        
-        echo 40; echo "XXX\n🔫 کشتن تمام پروسه‌های درگیر (Kill Processes)...\nXXX"
-        # کشتن هر پروسه پایتونی که مربوط به بات باشد برای جلوگیری از تداخل
-        pkill -f "$INSTALL_DIR/bot.py" > /dev/null 2>&1
-        killall python3 > /dev/null 2>&1  # احتیاط (ممکن است سایر اسکریپت‌ها را ببندد، اگر سرور اشتراکی است این خط را بردارید)
-        sleep 2
-        
-        echo 80; echo "XXX\n🚀 استارت مجدد سرویس...\nXXX"
-        systemctl start $SERVICE_NAME
-        
-        echo 100
-    } | whiptail --title "ریستارت سیستمی" --gauge "در حال پاکسازی و ریستارت..." 8 60 0
-    
+    print_title
+    echo -e "${BOLD}♻️ FULL SYSTEM RESTART...${RESET}\n"
+
+    print_info "Stopping service"
+    systemctl stop $SERVICE_NAME
+
+    print_info "Killing zombie processes"
+    # Kill all python processes running bot.py
+    pkill -f "$INSTALL_DIR/bot.py" > /dev/null 2>&1
+    # Optional: Kill all python3 if really needed (Commented for safety)
+    # killall python3 > /dev/null 2>&1 
+    sleep 2
+
+    print_info "Starting service fresh"
+    systemctl start $SERVICE_NAME
+
     if systemctl is-active --quiet $SERVICE_NAME; then
-        whiptail --msgbox "✅ ربات با موفقیت ریستارت شد.\nهمه پروسه‌های اضافه پاکسازی شدند." 8 50
+        print_success "Bot restarted successfully."
     else
-        whiptail --msgbox "❌ مشکل در استارت ربات. لطفا لاگ‌ها را چک کنید." 8 50
+        print_error "Failed to start bot. Check logs."
     fi
+    wait_enter
 }
 
-function configure_token_gui() {
+function configure_token() {
     MODE=$1
     CONFIG_FILE="$INSTALL_DIR/bot.py"
-    if [ ! -f "$CONFIG_FILE" ]; then return; fi
+    
+    if [ ! -f "$CONFIG_FILE" ]; then 
+        if [ "$MODE" != "install" ]; then
+            print_error "Bot file not found."
+            wait_enter
+            return
+        fi
+    fi
 
-    TOKEN=$(whiptail --inputbox "🤖 توکن جدید ربات را وارد کنید:" 10 60 --title "تنظیمات توکن" 3>&1 1>&2 2>&3)
-    if [ $? -ne 0 ]; then return; fi
+    if [ "$MODE" != "install" ]; then
+        print_title
+        echo -e "${BOLD}⚙️ CONFIGURATION${RESET}\n"
+    fi
 
-    ADMIN_ID=$(whiptail --inputbox "👤 آیدی عددی ادمین (Admin ID):" 10 60 --title "تنظیمات ادمین" 3>&1 1>&2 2>&3)
-    if [ $? -ne 0 ]; then return; fi
+    echo -e "${CYAN}🤖 Enter Telegram Bot Token:${RESET}"
+    read -p ">> " TOKEN_INPUT
 
-    sed -i "s/TOKEN = .*/TOKEN = '$TOKEN'/" "$CONFIG_FILE"
-    sed -i "s/SUPER_ADMIN_ID = .*/SUPER_ADMIN_ID = $ADMIN_ID/" "$CONFIG_FILE"
+    echo -e "\n${CYAN}👤 Enter Admin Numeric ID:${RESET}"
+    read -p ">> " ADMIN_INPUT
+
+    if [ -n "$TOKEN_INPUT" ] && [ -n "$ADMIN_INPUT" ]; then
+        sed -i "s/TOKEN = .*/TOKEN = '$TOKEN_INPUT'/" "$CONFIG_FILE"
+        sed -i "s/SUPER_ADMIN_ID = .*/SUPER_ADMIN_ID = $ADMIN_INPUT/" "$CONFIG_FILE"
+        print_success "Configuration saved."
+    else
+        print_error "Invalid input. Skipping config."
+    fi
 
     if [ "$MODE" != "install" ]; then
         full_restart_bot
@@ -185,48 +228,54 @@ function configure_token_gui() {
 }
 
 function uninstall_bot() {
-    if (whiptail --title "⚠️ حذف خطرناک" --yesno "آیا مطمئن هستید؟\n\n❌ کل دیتابیس و اطلاعات پاک می‌شود و قابل برگشت نیست!" 10 60); then
+    print_title
+    echo -e "${RED}${BOLD}🗑️ UNINSTALLATION${RESET}\n"
+    echo -e "⚠️  This will delete ALL data (Database, Logs, Config)."
+    read -p "Are you sure? (y/n): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
         systemctl stop $SERVICE_NAME
         systemctl disable $SERVICE_NAME > /dev/null 2>&1
         rm -f /etc/systemd/system/$SERVICE_NAME.service
         systemctl daemon-reload
         rm -rf "$INSTALL_DIR"
-        whiptail --msgbox "🗑️ ربات و تمام اطلاعات آن به طور کامل حذف شد." 8 45
+        print_success "Bot completely removed."
+    else
+        echo "Cancelled."
     fi
+    wait_enter
 }
 
 function view_logs() {
     clear
-    echo -e "${GREEN}📜 نمایش زنده لاگ‌ها (برای خروج Ctrl+C را بزنید)...${NC}"
-    echo -e "${YELLOW}---------------------------------------------------${NC}"
+    echo -e "${GREEN}${BOLD}📜 LIVE LOGS (Press Ctrl+C to exit)${RESET}"
+    echo -e "${BLUE}────────────────────────────────────────${RESET}"
     journalctl -u $SERVICE_NAME -f -n 50
 }
 
 # ==============================================================================
-# 🖥 MAIN MENU
+# 🖥 MAIN MENU LOOP
 # ==============================================================================
 while true; do
-    show_header
-    
-    OPTION=$(whiptail --title "🦇 Sonar Radar Ultra Monitor 1.0" --menu "یکی از گزینه‌ها را انتخاب کنید:" 20 70 10 \
-    "1" "🚀 نصب ربات (Install Bot)" \
-    "2" "🔄 آپدیت هوشمند (Update Bot)" \
-    "3" "♻️ ریستارت کامل و پاکسازی (Full Restart)" \
-    "4" "📜 مشاهده لاگ‌های زنده (Logs)" \
-    "5" "⚙️ تغییر توکن و آیدی ادمین (Config)" \
-    "6" "🗑️ حذف کامل ربات (Uninstall)" \
-    "7" "❌ خروج (Exit)" 3>&1 1>&2 2>&3)
-
-    exitstatus=$?
-    if [ $exitstatus != 0 ]; then exit; fi
+    print_title
+    echo -e " ${GREEN}1)${RESET} 🚀 Install Bot"
+    echo -e " ${GREEN}2)${RESET} 🔄 Update Bot"
+    echo -e " ${GREEN}3)${RESET} ♻️  Restart (Force Kill & Start)"
+    echo -e " ${GREEN}4)${RESET} 📜 View Logs"
+    echo -e " ${GREEN}5)${RESET} ⚙️  Config (Token & Admin)"
+    echo -e " ${GREEN}6)${RESET} 🗑️  Uninstall"
+    echo -e " ${RED}7) ❌ Exit${RESET}"
+    echo ""
+    echo -e "${BLUE}──────────────────────────────────${RESET}"
+    read -p " Select option [1-7]: " OPTION
 
     case $OPTION in
         1) install_bot ;;
         2) update_bot ;;
         3) full_restart_bot ;;
         4) view_logs ;;
-        5) configure_token_gui "menu" ;;
+        5) configure_token "menu" ;;
         6) uninstall_bot ;;
-        7) clear; echo "خداحافظ 👋"; exit ;;
+        7) clear; echo -e "${CYAN}Good Bye! 👋${RESET}"; exit ;;
+        *) echo -e "${RED}Invalid Option.${RESET}"; sleep 1 ;;
     esac
 done
