@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🦇 SONAR RADAR ULTRA MONITOR 1.4 - MANAGER (JSON CONFIG EDITION)
+# 🦇 SONAR RADAR ULTRA MONITOR 1.1
 # ==============================================================================
 
 # --- Configuration ---
