@@ -265,8 +265,8 @@ function uninstall_bot() {
 # --- Main Menu Loop ---
 while true; do
     print_title
-    echo -e " ${GREEN}1)${RESET} 🚀 Install Bot (Fresh Install)"
-    echo -e " ${GREEN}2)${RESET} 🔄 Update Bot (Clean Update - Keeps Data)"
+    echo -e " ${GREEN}1)${RESET} 🚀 Install Bot "
+    echo -e " ${GREEN}2)${RESET} 🔄 Update Bot "
     echo -e " ${GREEN}3)${RESET} ♻️  Restart Bot"
     echo -e " ${GREEN}4)${RESET} 📜 View Logs"
     echo -e " ${GREEN}5)${RESET} ⚙️  Change Token/Admin"
