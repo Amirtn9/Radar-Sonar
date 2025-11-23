@@ -108,36 +108,31 @@ class Security:
     def decrypt(self, txt):
         try:
             return self.cipher.decrypt(txt.encode()).decode()
-        except Exception as e: # Fix 3: اضافه کردن لاگ برای خطای رمزگشایی به جای صرفاً نادیده گرفتن
-            logger.error(f"Decryption failed for data: {txt[:10]}... Error: {e}") 
+        except:
             return "" # Handle decryption errors gracefully
 
 
 class Database:
     def __init__(self):
-        self.lock = threading.Lock()
-        # Fix 8: اگر self.conn از قبل وجود داشته باشد و باز باشد، آن را ببندیم.
-        # این برای اطمینان از تمیز بودن اتصال در زمان re-init (مانند restore backup) حیاتی است.
-        if hasattr(self, 'conn') and self.conn:
-             self.conn.close() 
-
-        self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        try: # Fix 1: اضافه کردن Try/Except برای اجرای PRAGMA تا در صورت خراب بودن دیتابیس (Malformed DB) کرش نکند.
-            self.conn.execute('PRAGMA journal_mode=WAL;')
-        except sqlite3.DatabaseError as e:
-            logger.error(f"Error setting PRAGMA journal_mode=WAL: {e}")
+        self.db_path = DB_NAME
+        # چک کردن اولیه فایل دیتابیس
         self.create_tables()
         self.migrate()
 
+    def get_conn(self):
+        """ ایجاد یک اتصال جدید برای هر درخواست جهت جلوگیری از تداخل تردها """
+        conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA journal_mode=WAL;')
+        return conn
+
     def close(self):
-        if self.conn:
-            self.conn.close()
-            self.conn = None # Fix 2: اتصال را به صراحت None می‌کنیم تا در هنگام Re-init مطمئن شویم که مرجع قبلی آزاد شده است.
+        # در روش جدید نیازی به بستن دستی نیست چون از Context Manager استفاده می‌کنیم
+        pass
 
     def create_tables(self):
-        with self.lock:
-            cursor = self.conn.cursor()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY, full_name TEXT, added_date TEXT, expiry_date TEXT,
                 server_limit INTEGER DEFAULT 2, is_banned INTEGER DEFAULT 0, plan_type INTEGER DEFAULT 0
@@ -161,17 +156,17 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER, cpu REAL, ram REAL, 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )''')
-            self.conn.commit()
+            conn.commit()
 
     def migrate(self):
-        with self.lock:
-            try: self.conn.execute("ALTER TABLE servers ADD COLUMN expiry_date TEXT")
+        with self.get_conn() as conn:
+            try: conn.execute("ALTER TABLE servers ADD COLUMN expiry_date TEXT")
             except: pass
-            try: self.conn.execute("ALTER TABLE channels ADD COLUMN usage_type TEXT DEFAULT 'all'")
+            try: conn.execute("ALTER TABLE channels ADD COLUMN usage_type TEXT DEFAULT 'all'")
             except: pass
-            try: self.conn.execute("ALTER TABLE users ADD COLUMN plan_type INTEGER DEFAULT 0")
+            try: conn.execute("ALTER TABLE users ADD COLUMN plan_type INTEGER DEFAULT 0")
             except: pass
-            self.conn.commit()
+            conn.commit()
             
     def toggle_user_plan(self, user_id):
         user = self.get_user(user_id)
@@ -180,67 +175,71 @@ class Database:
         new_plan = 1 if user['plan_type'] == 0 else 0
         new_limit = 50 if new_plan == 1 else 2
         
-        with self.lock:
-            self.conn.execute('UPDATE users SET plan_type = ?, server_limit = ? WHERE user_id = ?', (new_plan, new_limit, user_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE users SET plan_type = ?, server_limit = ? WHERE user_id = ?', (new_plan, new_limit, user_id))
+            conn.commit()
         return new_plan
     
     def add_or_update_user(self, user_id, full_name=None, days=None):
-        with self.lock:
-            exist = self.get_user(user_id)
-            now_str = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
+        exist = self.get_user(user_id)
+        now_str = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
+        
+        with self.get_conn() as conn:
             if exist:
                 if full_name:
-                    self.conn.execute('UPDATE users SET full_name = ? WHERE user_id = ?', (full_name, user_id))
+                    conn.execute('UPDATE users SET full_name = ? WHERE user_id = ?', (full_name, user_id))
                 if days is not None:
                     expiry = (get_tehran_datetime() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-                    self.conn.execute('UPDATE users SET expiry_date = ? WHERE user_id = ?', (expiry, user_id))
+                    conn.execute('UPDATE users SET expiry_date = ? WHERE user_id = ?', (expiry, user_id))
             else:
                 d = days if days else 30
                 expiry = (get_tehran_datetime() + timedelta(days=d)).strftime('%Y-%m-%d %H:%M:%S')
-                self.conn.execute('INSERT INTO users (user_id, full_name, added_date, expiry_date) VALUES (?, ?, ?, ?)', 
+                conn.execute('INSERT INTO users (user_id, full_name, added_date, expiry_date) VALUES (?, ?, ?, ?)', 
                                   (user_id, full_name, now_str, expiry))
-            self.conn.commit()
+            conn.commit()
             
     def update_user_limit(self, user_id, limit):
-        with self.lock:
-            self.conn.execute('UPDATE users SET server_limit = ? WHERE user_id = ?', (limit, user_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE users SET server_limit = ? WHERE user_id = ?', (limit, user_id))
+            conn.commit()
 
     def toggle_ban_user(self, user_id):
         user = self.get_user(user_id)
         if not user: return 0
         new_state = 0 if user['is_banned'] else 1
-        with self.lock:
-            self.conn.execute('UPDATE users SET is_banned = ? WHERE user_id = ?', (new_state, user_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE users SET is_banned = ? WHERE user_id = ?', (new_state, user_id))
+            conn.commit()
         return new_state
 
     def get_user(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        return cursor.fetchone()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+            return cursor.fetchone()
 
     def get_all_users_paginated(self, page=1, per_page=5):
         offset = (page - 1) * per_page
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users LIMIT ? OFFSET ?', (per_page, offset))
-        users = cursor.fetchall()
-        cursor.execute('SELECT COUNT(*) FROM users')
-        total = cursor.fetchone()[0]
-        return users, total
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users LIMIT ? OFFSET ?', (per_page, offset))
+            users = cursor.fetchall()
+            cursor.execute('SELECT COUNT(*) FROM users')
+            total = cursor.fetchone()[0]
+            return users, total
 
     def get_all_users(self):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users')
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM users')
+            return cursor.fetchall()
 
     def remove_user(self, user_id):
-        with self.lock:
+        with self.get_conn() as conn:
             for t in ['users', 'servers', 'groups', 'channels']:
                 col = 'user_id' if t == 'users' else 'owner_id'
-                self.conn.execute(f'DELETE FROM {t} WHERE {col} = ?', (user_id,))
-            self.conn.commit()
+                conn.execute(f'DELETE FROM {t} WHERE {col} = ?', (user_id,))
+            conn.commit()
 
     def check_access(self, user_id):
         if user_id == SUPER_ADMIN_ID: return True, "Super Admin"
@@ -256,121 +255,126 @@ class Database:
 
     # --- Group Methods ---
     def add_group(self, owner_id, name):
-        with self.lock:
-            self.conn.execute('INSERT INTO groups (owner_id, name) VALUES (?,?)', (owner_id, name))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('INSERT INTO groups (owner_id, name) VALUES (?,?)', (owner_id, name))
+            conn.commit()
 
     def get_user_groups(self, owner_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM groups WHERE owner_id = ?', (owner_id,))
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM groups WHERE owner_id = ?', (owner_id,))
+            return cursor.fetchall()
 
     def delete_group(self, group_id, owner_id):
-        with self.lock:
-            self.conn.execute('DELETE FROM groups WHERE id = ? AND owner_id = ?', (group_id, owner_id))
-            # Fix 5: اضافه کردن شرط owner_id برای جلوگیری از به روزرسانی ناخواسته سرورهای کاربران دیگر
-            self.conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ? AND owner_id = ?', (group_id, owner_id)) 
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('DELETE FROM groups WHERE id = ? AND owner_id = ?', (group_id, owner_id))
+            conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ?', (group_id,))
+            conn.commit()
 
     # --- Server Methods ---
     def add_server(self, owner_id, group_id, data):
-        # Fix 6: انتقال منطق چک کردن محدودیت سرور به داخل قفل (Lock) برای جلوگیری از Race Condition
+        user = self.get_user(owner_id)
+        current_servers = len(self.get_all_user_servers(owner_id))
+        if user and owner_id != SUPER_ADMIN_ID:
+            if current_servers >= user['server_limit']:
+                raise Exception("Server Limit Reached")
         g_id = group_id if group_id != 0 else None
-        with self.lock:
-            user = self.get_user(owner_id)
-            current_servers = len(self.get_all_user_servers(owner_id))
-            if user and owner_id != SUPER_ADMIN_ID:
-                if current_servers >= user['server_limit']:
-                    raise Exception("Server Limit Reached")
-            
-            self.conn.execute(
+        
+        with self.get_conn() as conn:
+            conn.execute(
                 'INSERT INTO servers (owner_id, group_id, name, ip, port, username, password, expiry_date) VALUES (?,?,?,?,?,?,?,?)',
                 (owner_id, g_id, data['name'], data['ip'], data['port'], data['username'], data['password'], data.get('expiry_date'))
             )
-            self.conn.commit()
+            conn.commit()
 
     def get_all_user_servers(self, owner_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM servers WHERE owner_id = ?', (owner_id,))
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM servers WHERE owner_id = ?', (owner_id,))
+            return cursor.fetchall()
 
     def get_servers_by_group(self, owner_id, group_id):
-        cursor = self.conn.cursor()
-        sql = 'SELECT * FROM servers WHERE owner_id = ? AND group_id IS NULL' if group_id == 0 else 'SELECT * FROM servers WHERE owner_id = ? AND group_id = ?'
-        cursor.execute(sql, (owner_id,) if group_id == 0 else (owner_id, group_id))
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            sql = 'SELECT * FROM servers WHERE owner_id = ? AND group_id IS NULL' if group_id == 0 else 'SELECT * FROM servers WHERE owner_id = ? AND group_id = ?'
+            cursor.execute(sql, (owner_id,) if group_id == 0 else (owner_id, group_id))
+            return cursor.fetchall()
 
     def get_server_by_id(self, s_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM servers WHERE id = ?', (s_id,))
-        return cursor.fetchone()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM servers WHERE id = ?', (s_id,))
+            return cursor.fetchone()
 
     def delete_server(self, s_id, owner_id):
-        with self.lock:
-            self.conn.execute('DELETE FROM servers WHERE id = ? AND owner_id = ?', (s_id, owner_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('DELETE FROM servers WHERE id = ? AND owner_id = ?', (s_id, owner_id))
+            conn.commit()
 
     def update_status(self, s_id, status):
-        with self.lock:
-            self.conn.execute('UPDATE servers SET last_status = ? WHERE id = ?', (status, s_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE servers SET last_status = ? WHERE id = ?', (status, s_id))
+            conn.commit()
 
     def update_server_expiry(self, s_id, new_date):
-        with self.lock:
-            self.conn.execute('UPDATE servers SET expiry_date = ? WHERE id = ?', (new_date, s_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE servers SET expiry_date = ? WHERE id = ?', (new_date, s_id))
+            conn.commit()
     
     def toggle_server_active(self, s_id, current_state):
         new_state = 0 if current_state else 1
-        with self.lock:
-            self.conn.execute('UPDATE servers SET is_active = ? WHERE id = ?', (new_state, s_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('UPDATE servers SET is_active = ? WHERE id = ?', (new_state, s_id))
+            conn.commit()
         return new_state
 
     # --- Stats & Charts ---
     def add_server_stat(self, server_id, cpu, ram):
-        with self.lock:
-            self.conn.execute('INSERT INTO server_stats (server_id, cpu, ram) VALUES (?, ?, ?)', (server_id, cpu, ram))
+        with self.get_conn() as conn:
+            conn.execute('INSERT INTO server_stats (server_id, cpu, ram) VALUES (?, ?, ?)', (server_id, cpu, ram))
             # Keep last 24h stats only
-            self.conn.execute("DELETE FROM server_stats WHERE created_at < datetime('now', '-1 day')")
-            self.conn.commit()
+            conn.execute("DELETE FROM server_stats WHERE created_at < datetime('now', '-1 day')")
+            conn.commit()
 
     def get_server_stats(self, server_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT cpu, ram, strftime('%H:%M', created_at, '+3 hours', '+30 minutes') as time_str 
-            FROM server_stats 
-            WHERE server_id = ? 
-            ORDER BY created_at ASC
-        ''', (server_id,))
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT cpu, ram, strftime('%H:%M', created_at, '+3 hours', '+30 minutes') as time_str 
+                FROM server_stats 
+                WHERE server_id = ? 
+                ORDER BY created_at ASC
+            ''', (server_id,))
+            return cursor.fetchall()
 
     # --- Channel & Settings Methods ---
     def add_channel(self, owner_id, chat_id, name, usage_type='all'):
-        with self.lock:
-            self.conn.execute('INSERT INTO channels (owner_id, chat_id, name, usage_type) VALUES (?,?,?,?)', (owner_id, chat_id, name, usage_type))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('INSERT INTO channels (owner_id, chat_id, name, usage_type) VALUES (?,?,?,?)', (owner_id, chat_id, name, usage_type))
+            conn.commit()
 
     def get_user_channels(self, owner_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM channels WHERE owner_id = ?', (owner_id,))
-        return cursor.fetchall()
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM channels WHERE owner_id = ?', (owner_id,))
+            return cursor.fetchall()
 
     def delete_channel(self, c_id, owner_id):
-        with self.lock:
-            self.conn.execute('DELETE FROM channels WHERE id = ? AND owner_id = ?', (c_id, owner_id))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('DELETE FROM channels WHERE id = ? AND owner_id = ?', (c_id, owner_id))
+            conn.commit()
 
     def set_setting(self, owner_id, key, value):
-        with self.lock:
-            self.conn.execute('REPLACE INTO settings (owner_id, key, value) VALUES (?, ?, ?)', (owner_id, key, str(value)))
-            self.conn.commit()
+        with self.get_conn() as conn:
+            conn.execute('REPLACE INTO settings (owner_id, key, value) VALUES (?, ?, ?)', (owner_id, key, str(value)))
+            conn.commit()
 
     def get_setting(self, owner_id, key):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT value FROM settings WHERE owner_id = ? AND key = ?', (owner_id, key,))
-        res = cursor.fetchone()
-        return res['value'] if res else None
+        with self.get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM settings WHERE owner_id = ? AND key = ?', (owner_id, key,))
+            res = cursor.fetchone()
+            return res['value'] if res else None
 
 # Initializing Global Objects
 db = Database()
@@ -729,8 +733,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_access, msg = db.check_access(user_id)
 
     if not has_access:
-        # Fix 7: استفاده از effective_message برای ارسال پیام دسترسی مسدود، تا هم برای دستورات (Command) و هم برای Callback Query ها کار کند.
-        await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown') 
+        await update.message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}")
         return
     
     remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
@@ -826,7 +829,9 @@ async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID: return
     
     users_count = len(db.get_all_users())
-    total_servers = len(db.conn.execute('SELECT id FROM servers').fetchall())
+    # Fix: استفاده از کانکشن امن برای دریافت تعداد سرورها
+    with db.get_conn() as conn:
+        total_servers = len(conn.execute('SELECT id FROM servers').fetchall())
     
     kb = [
         [InlineKeyboardButton("👥 مدیریت کاربران", callback_data='admin_users_page_1')],
@@ -1002,6 +1007,9 @@ async def admin_users_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Backup & Restore ---
 async def admin_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("در حال ارسال فایل...")
+    # استفاده از یک کانکشن برای اطمینان از همگام‌سازی WAL
+    with db.get_conn() as conn:
+        conn.execute("PRAGMA wal_checkpoint(FULL);")
     await update.callback_query.message.reply_document(document=open(DB_NAME, 'rb'), caption=f"📦 Backup: {get_jalali_str()}")
 
 async def admin_backup_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,12 +1059,27 @@ async def admin_backup_restore_handler(update: Update, context: ContextTypes.DEF
     if not doc.file_name.endswith('.db'):
         await update.message.reply_text("❌ فرمت فایل باید .db باشد.")
         return ADMIN_RESTORE_DB
+    
+    # دانلود فایل با نام موقت
+    temp_name = "temp_restore.db"
     f = await doc.get_file()
-    await f.download_to_drive(DB_NAME)
-    db.close()
-    db.__init__()
-    await update.message.reply_text("✅ دیتابیس با موفقیت بازنشانی شد.")
-    await start(update, context)
+    await f.download_to_drive(temp_name)
+    
+    # جایگزینی امن
+    try:
+        if os.path.exists(DB_NAME):
+            os.remove(DB_NAME)
+        os.rename(temp_name, DB_NAME)
+        
+        # Re-initialize to ensure tables exist if backup was old
+        db.create_tables()
+        db.migrate()
+        
+        await update.message.reply_text("✅ دیتابیس با موفقیت بازنشانی شد.")
+        await start(update, context)
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا در بازنشانی: {e}")
+    
     return ConversationHandler.END
 
 # --- Add New User Handlers ---
@@ -1765,8 +1788,7 @@ async def manage_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.callback_query.answer()
     servers = db.get_all_user_servers(update.effective_user.id)
     kb = [[InlineKeyboardButton(f"{'🟢' if s['is_active'] else '🔴'} | {s['name']}", callback_data=f'toggle_active_{s["id"]}')] for s in servers]
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')]
-    )
+    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')])
     await safe_edit_message(update, "🛠 **مدیریت مانیتورینگ:**\nبا کلیک روی هر سرور، مانیتورینگ آن را روشن/خاموش کنید.", reply_markup=InlineKeyboardMarkup(kb))
 
 async def toggle_server_active_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
