@@ -43,9 +43,9 @@ fi
 
 # --- Dependencies Check (Whiptail) ---
 if ! command -v whiptail &> /dev/null; then
-    echo -e "${YELLOW}📦 Installing necessary tools (whiptail)...${NC}"
-    apt-get update -y
-    apt-get install -y whiptail
+    echo -e "${YELLOW}📦 Installing GUI tools (whiptail)...${NC}"
+    apt-get update -y > /dev/null 2>&1
+    apt-get install -y whiptail > /dev/null 2>&1
 fi
 
 # ==============================================================================
@@ -56,16 +56,15 @@ fi
 function install_bot() {
     show_header
     
-    # 1. Stop existing service if running
+    # Stop existing service
     if systemctl is-active --quiet $SERVICE_NAME; then
         systemctl stop $SERVICE_NAME
-        echo -e "${YELLOW}🛑 Stopped existing service.${NC}"
     fi
 
-    # 2. Install System Dependencies
+    # Installation Process with Gauge
     {
         echo 10
-        echo "XXX\nUpdating package lists...\nXXX"
+        echo "XXX\nUpdating system packages...\nXXX"
         apt-get update -y > /dev/null 2>&1
         
         echo 30
@@ -73,41 +72,55 @@ function install_bot() {
         apt-get install -y python3 python3-pip python3-venv git curl > /dev/null 2>&1
         
         echo 50
-        echo "XXX\nCleaning old installation...\nXXX"
-        # Force remove directory to ensure fresh clone
+        echo "XXX\nPreparing directory...\nXXX"
+        # Preserve database if exists
+        if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then
+            cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db
+        fi
+        
         rm -rf "$INSTALL_DIR"
         mkdir -p "$INSTALL_DIR"
         
         echo 60
-        echo "XXX\nDownloading repository...\nXXX"
-        # Try Git Clone first
+        echo "XXX\nDownloading source code...\nXXX"
         if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
-            # Fallback to CURL if git fails
-            echo "XXX\nGit failed, using fallback download...\nXXX"
+            # Fallback to CURL
             curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
             curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
         fi
 
+        # Restore database
+        if [ -f "/tmp/sonar_backup.db" ]; then
+            mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"
+        fi
+
         echo 80
-        echo "XXX\nSetting up Python Environment...\nXXX"
+        echo "XXX\nCreating Virtual Environment...\nXXX"
         python3 -m venv "$INSTALL_DIR/venv"
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip > /dev/null 2>&1
-        pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
+        
+        echo 90
+        echo "XXX\nInstalling Python Libraries...\nXXX"
+        if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+            pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
+        else
+            pip install python-telegram-bot[job-queue] requests paramiko cryptography jdatetime matplotlib > /dev/null 2>&1
+        fi
         
         echo 100
-    } | whiptail --title "Installation Progress" --gauge "Installing Sonar Radar..." 8 60 0
+    } | whiptail --title "Installation" --gauge "Installing Sonar Radar..." 8 60 0
 
-    # 3. Verify Download
+    # Verify Download
     if [ ! -f "$INSTALL_DIR/bot.py" ]; then
-        whiptail --msgbox "❌ CRITICAL ERROR:\nFile 'bot.py' was not downloaded.\nCheck your internet connection or GitHub repository URL." 10 60
+        whiptail --msgbox "❌ Error: bot.py download failed." 8 45
         return
     fi
 
-    # 4. Configure Bot
+    # Configure Bot
     configure_bot_gui "install"
 
-    # 5. Setup Systemd Service
+    # Create Systemd Service
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Sonar Radar Ultra Pro Bot
@@ -125,12 +138,12 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    # 6. Enable & Start
+    # Enable Service
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
     systemctl restart $SERVICE_NAME
 
-    whiptail --msgbox "✅ Installation Complete!\n\n🤖 Bot is now running in the background." 10 50
+    whiptail --msgbox "✅ Installation Complete!\n\n🤖 Bot is now running." 8 45
 }
 
 # 2. Configuration GUI
@@ -139,61 +152,54 @@ function configure_bot_gui() {
     CONFIG_FILE="$INSTALL_DIR/bot.py"
 
     if [ ! -f "$CONFIG_FILE" ]; then
-        whiptail --msgbox "❌ bot.py not found! Please run 'Install' option first." 8 45
+        whiptail --msgbox "❌ bot.py not found. Install first." 8 45
         return
     fi
 
-    TOKEN=$(whiptail --inputbox "🤖 Enter Telegram Bot TOKEN:" 10 60 --title "Bot Setup" 3>&1 1>&2 2>&3)
+    TOKEN=$(whiptail --inputbox "🤖 Enter Telegram Bot TOKEN:" 10 60 --title "Bot Configuration" 3>&1 1>&2 2>&3)
     if [ $? -ne 0 ]; then return; fi
 
-    ADMIN_ID=$(whiptail --inputbox "👤 Enter Super Admin Numeric ID:" 10 60 --title "Bot Setup" 3>&1 1>&2 2>&3)
+    ADMIN_ID=$(whiptail --inputbox "👤 Enter Super Admin Numeric ID:" 10 60 --title "Bot Configuration" 3>&1 1>&2 2>&3)
     if [ $? -ne 0 ]; then return; fi
 
-    # Update File using sed
+    # Inject into bot.py using sed
     sed -i "s/TOKEN = .*/TOKEN = '$TOKEN'/" "$CONFIG_FILE"
     sed -i "s/SUPER_ADMIN_ID = .*/SUPER_ADMIN_ID = $ADMIN_ID/" "$CONFIG_FILE"
 
     if [ "$MODE" != "install" ]; then
-        if (whiptail --title "Restart Required" --yesno "Configuration saved. Restart bot now?" 8 45); then
+        if (whiptail --title "Restart" --yesno "Config saved. Restart bot now?" 8 45); then
             systemctl restart $SERVICE_NAME
-            whiptail --msgbox "✅ Bot Restarted with new config." 8 40
+            whiptail --msgbox "✅ Bot Restarted." 8 30
         fi
     fi
 }
 
 # 3. Uninstall Logic
 function uninstall_bot() {
-    if (whiptail --title "⚠️ DANGER ZONE" --yesno "Are you sure you want to completely REMOVE Sonar Radar?" 10 60); then
-        
+    if (whiptail --title "⚠️ DELETE BOT" --yesno "Are you sure you want to DELETE everything?" 10 60); then
         systemctl stop $SERVICE_NAME
         systemctl disable $SERVICE_NAME > /dev/null 2>&1
         rm -f /etc/systemd/system/$SERVICE_NAME.service
         systemctl daemon-reload
         rm -rf "$INSTALL_DIR"
-        
-        whiptail --msgbox "🗑️ Uninstallation Complete." 8 40
+        whiptail --msgbox "🗑️ Uninstalled successfully." 8 40
     fi
 }
 
-# 4. Logs Viewer
+# 4. View Logs
 function view_logs() {
     clear
-    echo -e "${GREEN}📜 Showing Live Logs (Press Ctrl+C to return)...${NC}"
-    echo -e "${YELLOW}-----------------------------------------------------${NC}"
+    echo -e "${GREEN}📜 Showing Logs (Ctrl+C to exit)...${NC}"
     journalctl -u $SERVICE_NAME -f -n 50
 }
 
 # 5. Check Status
 function check_status() {
-    STATUS=$(systemctl is-active $SERVICE_NAME)
-    if [ "$STATUS" == "active" ]; then
-        ICON="🟢"
-        MSG="Running"
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        whiptail --msgbox "✅ Status: RUNNING 🟢" 8 30
     else
-        ICON="🔴"
-        MSG="Stopped"
+        whiptail --msgbox "❌ Status: STOPPED 🔴" 8 30
     fi
-    whiptail --msgbox "📊 Status: $MSG $ICON" 8 40
 }
 
 # ==============================================================================
@@ -202,18 +208,17 @@ function check_status() {
 while true; do
     show_header
     
-    OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Choose an option:" 18 70 10 \
-    "1" "📥 Install / Re-Install (Force Update)" \
-    "2" "⚙️ Configure (Token & Admin ID)" \
+    OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Select an option:" 18 70 10 \
+    "1" "📥 Install / Update (Clean Install)" \
+    "2" "⚙️ Configure Token & Admin ID" \
     "3" "⏯️ Restart Bot" \
     "4" "🛑 Stop Bot" \
-    "5" "📜 Live Logs" \
-    "6" "📊 Check Status" \
-    "7" "🗑️ Uninstall" \
+    "5" "📜 View Live Logs" \
+    "6" "📊 Check Service Status" \
+    "7" "🗑️ Uninstall Completely" \
     "8" "❌ Exit" 3>&1 1>&2 2>&3)
 
-    exitstatus=$?
-    if [ $exitstatus != 0 ]; then exit; fi
+    if [ $? -ne 0 ]; then exit; fi
 
     case $OPTION in
         1) install_bot ;;
