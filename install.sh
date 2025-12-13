@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🦇 SONAR RADAR ULTRA MONITOR 1.2
+# 🦇 SONAR RADAR ULTRA MONITOR 1.5 - AUTO CONFIG MANAGER
 # ==============================================================================
 
 # --- Configuration ---
@@ -12,6 +12,7 @@ RAW_URL="https://raw.githubusercontent.com/Amirtn9/radar-sonar/main"
 DB_FILE="sonar_ultra_pro.db"
 KEY_FILE="secret.key"
 CONFIG_FILE="sonar_config.json"
+SETTINGS_FILE="settings.py"
 
 # --- Colors (Neon Theme) ---
 RESET='\033[0m'
@@ -34,7 +35,7 @@ function print_title() {
     echo "     \_/  \`/       \`'  \_/   "
     echo "           \`           \`      "
     echo -e "${RESET}"
-    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 1.4${RESET}"
+    echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR 1.5${RESET}"
     echo -e "   ${BLUE}──────────────────────────────────${RESET}"
     echo ""
 }
@@ -52,6 +53,19 @@ function read_json_val() {
         python3 -c "import json; print(json.load(open('$file')).get('$key', ''))" 2>/dev/null
     else
         echo ""
+    fi
+}
+
+# --- Helper: Update Settings.py ---
+function update_settings_py() {
+    local admin_id=$1
+    local settings_path="$INSTALL_DIR/$SETTINGS_FILE"
+    
+    if [ -f "$settings_path" ]; then
+        sed -i "s/^SUPER_ADMIN_ID = .*/SUPER_ADMIN_ID = $admin_id/" "$settings_path"
+        print_success "Updated SUPER_ADMIN_ID in $SETTINGS_FILE"
+    else
+        print_error "$SETTINGS_FILE not found, could not update admin ID in python file."
     fi
 }
 
@@ -90,9 +104,31 @@ function progress_bar() {
 if [ "$EUID" -ne 0 ]; then echo -e "${RED}❌ Please run as root.${RESET}"; exit 1; fi
 
 # ==============================================================================
+# 🔧 DATABASE CONFIGURATION
+# ==============================================================================
+function setup_postgres() {
+    print_info "Configuring PostgreSQL Database..."
+    
+    # 1. Start Postgres Service
+    systemctl start postgresql
+    systemctl enable postgresql
+    
+    # 2. Create User and Database (Match settings.py)
+    DB_NAME="sonar_ultra_pro"
+    DB_USER="sonar_user"
+    DB_PASS="SonarPassword2025"
+    
+    # Run commands as postgres user
+    sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" 2>/dev/null || true
+    sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" 2>/dev/null || true
+    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" 2>/dev/null || true
+    
+    print_success "PostgreSQL configured successfully."
+}
+
+# ==============================================================================
 # 🔧 CORE INSTALLATION LOGIC
 # ==============================================================================
-
 function install_process() {
     local KEEP_CONFIG=$1 # true = update mode, false = fresh install
     
@@ -109,19 +145,17 @@ function install_process() {
     local OLD_TOKEN=""
     local OLD_ADMIN=""
     
-    print_info "Backing up Database & Keys"
-    if [ -f "$INSTALL_DIR/$DB_FILE" ]; then cp "$INSTALL_DIR/$DB_FILE" /tmp/sonar_db.bak; fi
+    print_info "Backing up Configuration"
     if [ -f "$INSTALL_DIR/$KEY_FILE" ]; then cp "$INSTALL_DIR/$KEY_FILE" /tmp/sonar_key.bak; fi
     
-    # اگر آپدیت است، اطلاعات را از فایل JSON موجود می‌خوانیم
     if [ "$KEEP_CONFIG" = true ] && [ -f "$INSTALL_DIR/$CONFIG_FILE" ]; then
         print_info "Reading configuration from $CONFIG_FILE"
         OLD_TOKEN=$(read_json_val "$INSTALL_DIR/$CONFIG_FILE" "bot_token")
         OLD_ADMIN=$(read_json_val "$INSTALL_DIR/$CONFIG_FILE" "admin_id")
     fi
 
-    # 3. NUKE EVERYTHING (Clean Slate)
-    print_info "Wiping directory for fresh install"
+    # 3. Clean Slate
+    print_info "Wiping directory for installation"
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
 
@@ -130,19 +164,30 @@ function install_process() {
     apt-get update -y > /dev/null 2>&1 &
     show_loading $! "Apt Update..."
     
-    apt-get install -y python3 python3-pip python3-venv git curl build-essential libssl-dev libffi-dev python3-dev > /dev/null 2>&1 &
+    apt-get install -y python3 python3-pip python3-venv git curl build-essential libssl-dev libffi-dev python3-dev postgresql postgresql-contrib libpq-dev > /dev/null 2>&1 &
     show_loading $! "Installing OS Deps..."
+
+    # Configure Database right after installing packages
+    setup_postgres
 
     # 5. Download Source
     print_info "Cloning Source Code"
     if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
-        curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
-        curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
+        print_info "Git clone failed, downloading files manually..."
+        # Updated file list to include all required components
+        local FILES=("bot.py" "core.py" "cronjobs.py" "database.py" "keyboard.py" "settings.py" "monitor_agent.py" "admin_panel.py" "server_stats.py" "scoring.py" "tunnel_logic.py" "requirements.txt" "alerts.py" "logger_setup.py" "topics.py")
+        
+        for file in "${FILES[@]}"; do
+             curl -s -o "$INSTALL_DIR/$file" "$RAW_URL/$file"
+        done
+    fi
+
+    if [ -f "$INSTALL_DIR/monitor_agent.py" ]; then
+        chmod +x "$INSTALL_DIR/monitor_agent.py"
     fi
 
     # 6. Restore Data
-    print_info "Restoring Database & Keys"
-    if [ -f "/tmp/sonar_db.bak" ]; then mv /tmp/sonar_db.bak "$INSTALL_DIR/$DB_FILE"; fi
+    print_info "Restoring Keys"
     if [ -f "/tmp/sonar_key.bak" ]; then mv /tmp/sonar_key.bak "$INSTALL_DIR/$KEY_FILE"; fi
 
     # 7. Setup Python Environment
@@ -152,14 +197,14 @@ function install_process() {
 
     print_info "Installing Python Libraries"
     pip install --upgrade pip setuptools wheel > /dev/null 2>&1
-    pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1 &
+    pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests psycopg2-binary > /dev/null 2>&1 &
     show_loading $! "Pip Install..."
 
     # 8. Setup Service
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Sonar Radar Ultra Pro Bot
-After=network.target
+After=network.target postgresql.service
 
 [Service]
 Type=simple
@@ -175,12 +220,12 @@ EOF
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
 
-    # 9. Handle Configuration (Restore or Ask)
+    # 9. Handle Configuration
     if [ "$KEEP_CONFIG" = true ] && [ -n "$OLD_TOKEN" ]; then
         print_info "Restoring Config (Token & Admin ID)"
         echo "{\"bot_token\": \"$OLD_TOKEN\", \"admin_id\": \"$OLD_ADMIN\"}" > "$INSTALL_DIR/$CONFIG_FILE"
+        update_settings_py "$OLD_ADMIN"
     else
-        # Fresh install or config missing -> Ask User
         configure_token_interactive
     fi
 
@@ -188,13 +233,12 @@ EOF
     print_info "Starting Bot Service"
     systemctl restart $SERVICE_NAME
     
-    # Fake loading time for python startup
     progress_bar 5
 
     if systemctl is-active --quiet $SERVICE_NAME; then
         print_success "Bot is ONLINE and Ready! 🦇"
     else
-        print_error "Bot failed to start. Check logs."
+        print_error "Bot failed to start. Check logs (journalctl -u $SERVICE_NAME -f)."
     fi
     wait_enter
 }
@@ -208,11 +252,11 @@ function configure_token_interactive() {
     read -p ">> " ADMIN_INPUT
 
     if [ -n "$TOKEN_INPUT" ] && [ -n "$ADMIN_INPUT" ]; then
-        # Create the JSON config file
         echo "{\"bot_token\": \"$TOKEN_INPUT\", \"admin_id\": \"$ADMIN_INPUT\"}" > "$INSTALL_DIR/$CONFIG_FILE"
-        print_success "Config saved to $CONFIG_FILE"
+        update_settings_py "$ADMIN_INPUT"
+        print_success "Configuration Saved & Applied!"
     else
-        print_error "Invalid input. Config file not created."
+        print_error "Invalid input. Config failed."
     fi
 }
 
@@ -275,13 +319,14 @@ while true; do
     echo ""
     read -p " Select [1-7]: " OPTION
     case $OPTION in
-        1) install_process false ;; # Fresh install (Ask config)
-        2) install_process true  ;; # Update (Keep config)
+        1) install_process false ;; 
+        2) install_process true  ;; 
         3) full_restart ;;
         4) view_logs ;;
         5) manual_config_menu ;;
         6) uninstall_bot ;;
         7) clear; exit ;;
+        8) setup_postgres ;;
         *) echo "Invalid Option" ;;
     esac
 done

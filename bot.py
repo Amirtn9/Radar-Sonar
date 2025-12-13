@@ -1,5 +1,5 @@
 import logging
-import sqlite3
+import traceback
 import os
 import json
 import asyncio
@@ -10,26 +10,19 @@ import statistics
 import io
 import html
 import re
+import base64
+import urllib.parse
+import shlex
 import datetime as dt
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-
-# --- Standard Time & Date Libraries ---
-from datetime import datetime, timedelta, timezone
+import topics
+import subprocess
+from settings import DB_CONFIG  # برای دسترسی به یوزر و پسورد دیتابیس
+# --- Third-Party Libraries ---
 import jdatetime
-
-# --- Networking & Cryptography ---
-import requests
-import paramiko
 from cryptography.fernet import Fernet
-
-# --- Plotting (Matplotlib - Thread Safe Fix) ---
-import matplotlib
-matplotlib.use('Agg')  # Set backend to non-interactive
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-# --- Telegram Libraries ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest, TelegramError, Conflict, NetworkError
 from telegram.ext import (
@@ -37,121 +30,89 @@ from telegram.ext import (
     MessageHandler, filters, ConversationHandler, JobQueue
 )
 
-# ==============================================================================
-# ⚙️ CONFIGURATION & CONSTANTS
-# ==============================================================================
-CONFIG_FILE = 'sonar_config.json'
+# --- Local Modules ---
+from logger_setup import setup_logger
+import keyboard
+import admin_panel
+import cronjobs
+from database import Database
+from tunnel_logic import tunnel_manager
+from server_stats import StatsManager
+from scoring import ScoreEngine
+from core import (
+    ServerMonitor, get_jalali_str, generate_plot, 
+    get_tehran_datetime, extract_safe_json
+)
+from settings import (
+    DB_NAME, CONFIG_FILE, KEY_FILE, AGENT_FILE_PATH, 
+    SUBSCRIPTION_PLANS, PAYMENT_INFO, DEFAULT_INTERVAL, 
+    DOWN_RETRY_LIMIT, SUPER_ADMIN_ID
+)
 
+# ==============================================================================
+# 🚀 INITIALIZATION & CONFIGURATION
+# ==============================================================================
+
+logger = setup_logger()
+warnings.filterwarnings("ignore")
+
+def get_agent_content():
+    """خواندن محتوای فایل ایجنت به صورت داینامیک"""
+    try:
+        if os.path.exists(AGENT_FILE_PATH):
+            with open(AGENT_FILE_PATH, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
+    except Exception as e:
+        logger.error(f"❌ Error loading agent script: {e}")
+        return ""
+
+print(f"✅ Agent Script Status: {'Found' if get_agent_content() else 'Not Found (Will retry later)'}")
+
+# ==============================================================================
+# ⚙️ DYNAMIC CONFIGURATION
+# ==============================================================================
 try:
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
             TOKEN = config.get('bot_token', 'Not_Set')
             try:
-                SUPER_ADMIN_ID = int(config.get('admin_id', 0))
+                SUPER_ADMIN_ID = int(config.get('admin_id', SUPER_ADMIN_ID))
             except:
-                SUPER_ADMIN_ID = 0
+                pass 
     else:
         TOKEN = 'TOKEN_NOT_SET'
-        SUPER_ADMIN_ID = 0
         print(f"⚠️ Config file ({CONFIG_FILE}) not found. Please run install.sh")
 except Exception as e:
-    print(f"❌ Error loading config: {e}")
+    logger.error(f"❌ Error loading config: {e}")
     TOKEN = 'ERROR'
-    SUPER_ADMIN_ID = 0
 
-DEFAULT_INTERVAL = 40
-DOWN_RETRY_LIMIT = 3
-DB_NAME = 'sonar_ultra_pro.db'
-KEY_FILE = 'secret.key'
-# --- Subscription Configuration (تنظیمات اشتراک و پرداخت) ---
-SUBSCRIPTION_PLANS = {
-    'bronze': {
-        'name': 'برنزی 🥉',
-        'limit': 5,
-        'days': 30,
-        'price': 100000,
-        'desc': 'مناسب برای استفاده شخصی'
-    },
-    'silver': {
-        'name': 'نقره‌ای 🥈',
-        'limit': 10,
-        'days': 30,
-        'price': 180000,
-        'desc': 'مناسب برای تیم‌های کوچک'
-    },
-    'gold': {
-        'name': 'طلایی 🥇',
-        'limit': 15,
-        'days': 30,
-        'price': 240000,
-        'desc': 'حرفه‌ای و بدون محدودیت'
-    }
-}
-
-# اطلاعات پرداخت (اطلاعات خود را جایگزین کنید)
-PAYMENT_INFO = {
-    'card': {
-        'number': '6037-9979-0000-0000',
-        'name': 'نام صاحب حساب'
-    },
-    'tron': {
-        'address': 'TRC20_WALLET_ADDRESS_HERE',
-        'network': 'TRC20'
-    }
-}
 # --- Global Cache & State Trackers ---
-SERVER_FAILURE_COUNTS = {}
-LAST_REPORT_CACHE = {}
-CPU_ALERT_TRACKER = {}
-DAILY_REPORT_USAGE = {}
 UPTIME_MILESTONE_TRACKER = set()
-CPU_ALERT_TRACKER = {}
-DAILY_REPORT_USAGE = {}
 SSH_SESSION_CACHE = {}
+USER_ACTIVE_TASKS = {}
 
 # --- Conversation States ---
 (
-    GET_NAME, GET_IP, GET_PORT, GET_USER, GET_PASS, SELECT_GROUP,
-    GET_GROUP_NAME, GET_CHANNEL_FORWARD, GET_MANUAL_HOST,
-    ADD_ADMIN_ID, ADD_ADMIN_DAYS, ADMIN_SEARCH_USER,
-    ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_RESTORE_KEY, ADMIN_SET_TIME_MANUAL,
-    GET_CUSTOM_INTERVAL,
-    GET_EXPIRY,
-    GET_CHANNEL_TYPE,
-    EDIT_SERVER_EXPIRY,
-    GET_REMOTE_COMMAND,  
-    GET_CPU_LIMIT, GET_RAM_LIMIT, GET_DISK_LIMIT,
-    GET_BROADCAST_MSG,
-    GET_REBOOT_TIME,
-    ADD_PAY_TYPE, ADD_PAY_NET, ADD_PAY_ADDR, ADD_PAY_HOLDER,
-    GET_RECEIPT
+    GET_NAME, GET_IP, GET_PORT, GET_USER, GET_PASS, SELECT_GROUP,          
+    GET_GROUP_NAME, GET_CHANNEL_FORWARD, GET_MANUAL_HOST,                  
+    ADD_ADMIN_ID, ADD_ADMIN_DAYS, ADMIN_SEARCH_USER,                       
+    ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_RESTORE_KEY, ADMIN_SET_TIME_MANUAL, 
+    GET_CUSTOM_INTERVAL, GET_EXPIRY, GET_CHANNEL_TYPE,                     
+    EDIT_SERVER_EXPIRY, GET_REMOTE_COMMAND,                                
+    GET_CPU_LIMIT, GET_RAM_LIMIT, GET_DISK_LIMIT,                          
+    GET_BROADCAST_MSG, GET_REBOOT_TIME,                                    
+    ADD_PAY_TYPE, ADD_PAY_NET, ADD_PAY_ADDR, ADD_PAY_HOLDER,               
+    GET_RECEIPT                                                            
 ) = range(31)
 
-# --- Logging Setup ---
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s', 
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-warnings.filterwarnings("ignore")
-
-
-# ==============================================================================
-# 📅 DATE & TIME UTILS
-# ==============================================================================
-def get_tehran_datetime():
-    return datetime.now(timezone.utc) + timedelta(hours=3, minutes=30)
-
-def get_jalali_str():
-    tehran_now = get_tehran_datetime()
-    j_date = jdatetime.datetime.fromgregorian(datetime=tehran_now)
-    months = {
-        1: 'فروردین', 2: 'اردیبهشت', 3: 'خرداد', 4: 'تیر', 5: 'مرداد', 
-        6: 'شهریور', 7: 'مهر', 8: 'آبان', 9: 'آذر', 10: 'دی', 11: 'بهمن', 12: 'اسفند'
-    }
-    return f"{j_date.day} {months[j_date.month]} {j_date.year} | {j_date.hour:02d}:{j_date.minute:02d}"
-
+GET_IRAN_NAME, GET_IRAN_IP, GET_IRAN_PORT, GET_IRAN_USER, GET_IRAN_PASS = range(200, 205)
+GET_GROUP_ID_FOR_TOPICS = range(400, 401)[0]
+GET_JSON_CONF, GET_SUB_LINK, GET_CONFIG_LINKS, GET_SUB_NAME, SELECT_CONFIG_TYPE = range(210, 215)
+GET_CUSTOM_BIG_INTERVAL, GET_CUSTOM_BIG_SIZE, GET_CUSTOM_SMALL_SIZE = range(220, 223)
+SELECT_ADD_METHOD, GET_LINEAR_DATA = range(100, 102)
+ADMIN_GET_UID_FOR_REPORT = range(300)
 
 # ==============================================================================
 # 🔐 SECURITY & DATABASE
@@ -173,951 +134,114 @@ class Security:
             return self.cipher.decrypt(txt.encode()).decode()
         except Exception as e:
             logger.error(f"Decryption failed: {e}")
-            return "" 
+            return ""
 
-
-class Database:
-    def __init__(self):
-        self.db_name = DB_NAME
-        self.init_db()
-
-    @contextmanager
-    def get_connection(self):
-        conn = sqlite3.connect(self.db_name, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute('PRAGMA journal_mode=WAL;')
-            yield conn
-        except sqlite3.Error as e:
-            logger.error(f"Database Error: {e}")
-        finally:
-            conn.close()
-
-    def init_db(self):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY, full_name TEXT, added_date TEXT, expiry_date TEXT,
-                server_limit INTEGER DEFAULT 2, is_banned INTEGER DEFAULT 0, plan_type INTEGER DEFAULT 0
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS groups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, name TEXT, UNIQUE(owner_id, name)
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS servers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, group_id INTEGER, name TEXT, 
-                ip TEXT, port INTEGER, username TEXT, password TEXT, expiry_date TEXT, 
-                last_status TEXT DEFAULT 'Unknown', is_active INTEGER DEFAULT 1, UNIQUE(owner_id, name)
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS settings (
-                owner_id INTEGER, key TEXT, value TEXT, PRIMARY KEY(owner_id, key)
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id TEXT, name TEXT, 
-                usage_type TEXT DEFAULT "all"
-            )''')
-            cursor.execute('''CREATE TABLE IF NOT EXISTS server_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER, cpu REAL, ram REAL, 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )''')
-            conn.commit()
-            self.migrate()
-
-    def migrate(self):
-        with self.get_connection() as conn:
-            try: conn.execute("ALTER TABLE servers ADD COLUMN expiry_date TEXT")
-            except: pass
-            try: conn.execute("ALTER TABLE channels ADD COLUMN usage_type TEXT DEFAULT 'all'")
-            except: pass
-            try: conn.execute("ALTER TABLE users ADD COLUMN plan_type INTEGER DEFAULT 0")
-            except: pass
-            try: conn.execute("ALTER TABLE users ADD COLUMN wallet_balance INTEGER DEFAULT 0")
-            except: pass
-            try: conn.execute("ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0")
-            except: pass
-            try: conn.execute("ALTER TABLE users ADD COLUMN invited_by INTEGER DEFAULT 0")
-            except: pass
-            
-            # --- جدول جدید پرداخت‌ها ---
-            conn.execute('''CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                plan_type TEXT,
-                amount INTEGER,
-                method TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TEXT
-            )''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS temp_bonuses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                bonus_limit INTEGER,
-                created_at TEXT,
-                expires_at TEXT
-            )''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS payment_methods (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT,        -- 'card' or 'crypto'
-                network TEXT,     -- Bank Name or Network (TRC20/TON)
-                address TEXT,     -- Card Number or Wallet Address
-                holder_name TEXT, -- Owner Name
-                is_active INTEGER DEFAULT 1
-            )''')
-            conn.commit()
-    # --- Payment Methods ---
-    def create_payment(self, user_id, plan_type, amount, method):
-        now = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO payments (user_id, plan_type, amount, method, created_at) VALUES (?, ?, ?, ?, ?)',
-                (user_id, plan_type, amount, method, now)
-            )
-            conn.commit()
-            return cursor.lastrowid
-
-    def approve_payment(self, payment_id):
-        with self.get_connection() as conn:
-            # 1. گرفتن اطلاعات پرداخت
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
-            pay = cursor.fetchone()
-            
-            if not pay or pay['status'] == 'approved': return False
-            
-            # 2. آپدیت وضعیت پرداخت
-            conn.execute("UPDATE payments SET status = 'approved' WHERE id = ?", (payment_id,))
-            
-            # 3. اعمال تغییرات روی کاربر
-            plan = SUBSCRIPTION_PLANS.get(pay['plan_type'])
-            if plan:
-                # محاسبه تاریخ انقضا
-                cursor.execute('SELECT * FROM users WHERE user_id = ?', (pay['user_id'],))
-                user = cursor.fetchone()
-                
-                try:
-                    current_exp = datetime.strptime(user['expiry_date'], '%Y-%m-%d %H:%M:%S')
-                    if current_exp < datetime.now(): current_exp = datetime.now()
-                except:
-                    current_exp = datetime.now()
-                
-                new_exp = (current_exp + timedelta(days=plan['days'])).strftime('%Y-%m-%d %H:%M:%S')
-                
-                # تعیین کد پلن (1=Bronze, 2=Silver, 3=Gold)
-                p_type_code = 1 if pay['plan_type'] == 'bronze' else 2 if pay['plan_type'] == 'silver' else 3
-                
-                conn.execute('''
-                    UPDATE users 
-                    SET server_limit = ?, expiry_date = ?, plan_type = ? 
-                    WHERE user_id = ?
-                ''', (plan['limit'], new_exp, p_type_code, pay['user_id']))
-                
-            conn.commit()
-            return pay['user_id'], plan['name']
-    def apply_referral_reward(self, inviter_id):
-        """اعمال جایزه: +1 سرور (موقت ۱۰ روزه) و +10 روز اعتبار"""
-        user = self.get_user(inviter_id)
-        if not user: return False, 0, ""
-        
-        # 1. افزایش لیمیت کاربر
-        new_limit = user['server_limit'] + 1
-        
-        # 2. افزایش تاریخ انقضای اکانت (+10 روز)
-        try:
-            current_exp = datetime.strptime(user['expiry_date'], '%Y-%m-%d %H:%M:%S')
-            if current_exp < datetime.now(): current_exp = datetime.now()
-            new_exp = (current_exp + timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')
-        except:
-            new_exp = (datetime.now() + timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')
-
-        # 3. محاسبه زمان انقضای پاداش سرور (۱۰ روز بعد از الان)
-        bonus_expiry = (datetime.now() + timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')
-        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        with self.get_connection() as conn:
-            # آپدیت کاربر
-            conn.execute('''
-                UPDATE users 
-                SET server_limit = ?, expiry_date = ?, referral_count = referral_count + 1 
-                WHERE user_id = ?
-            ''', (new_limit, new_exp, inviter_id))
-            
-            # ثبت پاداش موقت در جدول جدید
-            conn.execute('''
-                INSERT INTO temp_bonuses (user_id, bonus_limit, created_at, expires_at)
-                VALUES (?, 1, ?, ?)
-            ''', (inviter_id, now_str, bonus_expiry))
-            
-            conn.commit()
-            
-        return True, new_limit, new_exp
-
-    def update_wallet(self, user_id, amount):
-        """افزایش یا کاهش موجودی (amount می‌تواند منفی باشد)"""
-        with self.get_connection() as conn:
-            conn.execute('UPDATE users SET wallet_balance = wallet_balance + ? WHERE user_id = ?', (amount, user_id))
-            conn.commit()        
-    def toggle_user_plan(self, user_id):
-        user = self.get_user(user_id)
-        if not user: return 0 
-        new_plan = 1 if user['plan_type'] == 0 else 0
-        new_limit = 10 if new_plan == 1 else 2
-        with self.get_connection() as conn:
-            conn.execute('UPDATE users SET plan_type = ?, server_limit = ? WHERE user_id = ?', (new_plan, new_limit, user_id))
-            conn.commit()
-        return new_plan
-    
-    def add_or_update_user(self, user_id, full_name=None, invited_by=0):
-        exist = self.get_user(user_id)
-        now_str = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
-        default_limit = 2
-        default_days = 60
-        
-        with self.get_connection() as conn:
-            if exist:
-                if full_name:
-                    conn.execute('UPDATE users SET full_name = ? WHERE user_id = ?', (full_name, user_id))
-            else:
-                expiry = (get_tehran_datetime() + timedelta(days=default_days)).strftime('%Y-%m-%d %H:%M:%S')
-                conn.execute('''
-                    INSERT INTO users (user_id, full_name, added_date, expiry_date, server_limit, invited_by, wallet_balance, referral_count) 
-                    VALUES (?, ?, ?, ?, ?, ?, 0, 0)
-                ''', (user_id, full_name, now_str, expiry, default_limit, invited_by))
-            conn.commit()
-            
-    def update_user_limit(self, user_id, limit):
-        with self.get_connection() as conn:
-            conn.execute('UPDATE users SET server_limit = ? WHERE user_id = ?', (limit, user_id))
-            conn.commit()
-
-    def toggle_ban_user(self, user_id):
-        user = self.get_user(user_id)
-        if not user: return 0
-        new_state = 0 if user['is_banned'] else 1
-        with self.get_connection() as conn:
-            conn.execute('UPDATE users SET is_banned = ? WHERE user_id = ?', (new_state, user_id))
-            conn.commit()
-        return new_state
-
-    def get_user(self, user_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-            return cursor.fetchone()
-
-    def get_all_users_paginated(self, page=1, per_page=5):
-        offset = (page - 1) * per_page
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users LIMIT ? OFFSET ?', (per_page, offset))
-            users = cursor.fetchall()
-            cursor.execute('SELECT COUNT(*) FROM users')
-            total = cursor.fetchone()[0]
-            return users, total
-
-    def get_all_users(self):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM users')
-            return cursor.fetchall()
-
-    def remove_user(self, user_id):
-        with self.get_connection() as conn:
-            for t in ['users', 'servers', 'groups', 'channels']:
-                col = 'user_id' if t == 'users' else 'owner_id'
-                conn.execute(f'DELETE FROM {t} WHERE {col} = ?', (user_id,))
-            conn.commit()
-
-    def check_access(self, user_id):
-        if user_id == SUPER_ADMIN_ID: return True, "Super Admin"
-        user = self.get_user(user_id)
-        if not user: return False, "کاربر یافت نشد"
-        if user['is_banned']: return False, "حساب شما مسدود شده است ⛔️"
-        try:
-            expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d %H:%M:%S')
-            now_tehran_naive = get_tehran_datetime().replace(tzinfo=None)
-            if now_tehran_naive > expiry_dt: return False, "اشتراک شما منقضی شده است 📅"
-            return True, (expiry_dt - now_tehran_naive).days
-        except: return False, "خطا در تاریخ"
-
-    # --- Group Methods ---
-    def add_group(self, owner_id, name):
-        with self.get_connection() as conn:
-            conn.execute('INSERT INTO groups (owner_id, name) VALUES (?,?)', (owner_id, name))
-            conn.commit()
-
-    def get_user_groups(self, owner_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM groups WHERE owner_id = ?', (owner_id,))
-            return cursor.fetchall()
-
-    def delete_group(self, group_id, owner_id):
-        with self.get_connection() as conn:
-            conn.execute('DELETE FROM groups WHERE id = ? AND owner_id = ?', (group_id, owner_id))
-            conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ? AND owner_id = ?', (group_id, owner_id)) 
-            conn.commit()
-
-    # --- Server Methods ---
-    def add_server(self, owner_id, group_id, data):
-        g_id = group_id if group_id != 0 else None
-        user = self.get_user(owner_id)
-        current_servers_list = self.get_all_user_servers(owner_id)
-        current_count = len(current_servers_list)
-
-        if user and owner_id != SUPER_ADMIN_ID:
-            if current_count >= user['server_limit']:
-                raise Exception("Server Limit Reached")
-        
-        with self.get_connection() as conn:
-            # --- تغییر جدید: شروع تایمر ۳۰ روزه با اولین سرور ---
-            if current_count == 0 and user['plan_type'] == 0:
-                new_expiry = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
-                conn.execute('UPDATE users SET expiry_date = ? WHERE user_id = ?', (new_expiry, owner_id))
-            # -----------------------------------------------------
-
-            conn.execute(
-                'INSERT INTO servers (owner_id, group_id, name, ip, port, username, password, expiry_date) VALUES (?,?,?,?,?,?,?,?)',
-                (owner_id, g_id, data['name'], data['ip'], data['port'], data['username'], data['password'], data.get('expiry_date'))
-            )
-            conn.commit()
-
-    def get_all_user_servers(self, owner_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM servers WHERE owner_id = ?', (owner_id,))
-            return cursor.fetchall()
-
-    def get_servers_by_group(self, owner_id, group_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            sql = 'SELECT * FROM servers WHERE owner_id = ? AND group_id IS NULL' if group_id == 0 else 'SELECT * FROM servers WHERE owner_id = ? AND group_id = ?'
-            cursor.execute(sql, (owner_id,) if group_id == 0 else (owner_id, group_id))
-            return cursor.fetchall()
-
-    def get_server_by_id(self, s_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM servers WHERE id = ?', (s_id,))
-            return cursor.fetchone()
-
-    def delete_server(self, s_id, owner_id):
-        with self.get_connection() as conn:
-            conn.execute('DELETE FROM servers WHERE id = ? AND owner_id = ?', (s_id, owner_id))
-            conn.commit()
-
-    def update_status(self, s_id, status):
-        with self.get_connection() as conn:
-            conn.execute('UPDATE servers SET last_status = ? WHERE id = ?', (status, s_id))
-            conn.commit()
-
-    def update_server_expiry(self, s_id, new_date):
-        with self.get_connection() as conn:
-            conn.execute('UPDATE servers SET expiry_date = ? WHERE id = ?', (new_date, s_id))
-            conn.commit()
-    
-    def toggle_server_active(self, s_id, current_state):
-        new_state = 0 if current_state else 1
-        with self.get_connection() as conn:
-            conn.execute('UPDATE servers SET is_active = ? WHERE id = ?', (new_state, s_id))
-            conn.commit()
-        return new_state
-
-    # --- Stats & Charts ---
-    def add_server_stat(self, server_id, cpu, ram):
-        with self.get_connection() as conn:
-            conn.execute('INSERT INTO server_stats (server_id, cpu, ram) VALUES (?, ?, ?)', (server_id, cpu, ram))
-            conn.execute("DELETE FROM server_stats WHERE created_at < datetime('now', '-1 day')")
-            conn.commit()
-
-    def get_server_stats(self, server_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT cpu, ram, strftime('%H:%M', created_at, '+3 hours', '+30 minutes') as time_str 
-                FROM server_stats 
-                WHERE server_id = ? 
-                ORDER BY created_at ASC
-            ''', (server_id,))
-            return cursor.fetchall()
-
-    # --- Channel & Settings Methods ---
-    def add_channel(self, owner_id, chat_id, name, usage_type='all'):
-        with self.get_connection() as conn:
-            conn.execute('INSERT INTO channels (owner_id, chat_id, name, usage_type) VALUES (?,?,?,?)', (owner_id, chat_id, name, usage_type))
-            conn.commit()
-
-    def get_user_channels(self, owner_id):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM channels WHERE owner_id = ?', (owner_id,))
-            return cursor.fetchall()
-
-    def delete_channel(self, c_id, owner_id):
-        with self.get_connection() as conn:
-            conn.execute('DELETE FROM channels WHERE id = ? AND owner_id = ?', (c_id, owner_id))
-            conn.commit()
-
-    def set_setting(self, owner_id, key, value):
-        with self.get_connection() as conn:
-            conn.execute('REPLACE INTO settings (owner_id, key, value) VALUES (?, ?, ?)', (owner_id, key, str(value)))
-            conn.commit()
-
-    def get_setting(self, owner_id, key):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT value FROM settings WHERE owner_id = ? AND key = ?', (owner_id, key,))
-            res = cursor.fetchone()
-            return res['value'] if res else None
-    # --- Payment Settings Management ---
-    def add_payment_method(self, p_type, network, address, holder):
-        with self.get_connection() as conn:
-            conn.execute(
-                'INSERT INTO payment_methods (type, network, address, holder_name) VALUES (?, ?, ?, ?)',
-                (p_type, network, address, holder)
-            )
-            conn.commit()
-
-    def get_payment_methods(self, p_type=None):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            if p_type:
-                cursor.execute('SELECT * FROM payment_methods WHERE type = ? AND is_active = 1', (p_type,))
-            else:
-                cursor.execute('SELECT * FROM payment_methods')
-            return cursor.fetchall()
-
-    def delete_payment_method(self, p_id):
-        with self.get_connection() as conn:
-            conn.execute('DELETE FROM payment_methods WHERE id = ?', (p_id,))
-            conn.commit()
-    # --- پایان whitelist_bot_ip ---
-# Initializing Global Objects
 db = Database()
 sec = Security()
 
-
 # ==============================================================================
-# 🧠 SERVER MONITOR CORE
+# 🚀 STARTUP & MENU HANDLERS
 # ==============================================================================
-class ServerMonitor:
-    @staticmethod
-    def get_ssh_client(ip, port, user, password):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(ip, port=port, username=user, password=password, timeout=10)
-        return client
-    @staticmethod
-    def get_bot_public_ip():
-        """آی‌پی سرور خود ربات را می‌گیرد"""
-        try:
-            return requests.get("https://api.ipify.org", timeout=5).text.strip()
-        except:
-            return None
-
-    @staticmethod
-    def whitelist_bot_ip(target_ip, port, user, password, bot_ip):
-        """آی‌پی ربات را در سرور مقصد وایت‌لیست می‌کند"""
-        if not bot_ip: return False, "Bot IP not found"
-        
-        cmds = [
-            f"fail2ban-client set sshd addignoreip {bot_ip} || true",  # اگر fail2ban نصب باشد
-            f"ufw allow from {bot_ip} || true",                      # اگر ufw فعال باشد
-            f"iptables -I INPUT -s {bot_ip} -j ACCEPT || true"       # جهت اطمینان در iptables
-        ]
-        full_cmd = " && ".join(cmds)
-        
-        return ServerMonitor.run_remote_command(target_ip, port, user, password, full_cmd, timeout=20)
-    @staticmethod
-    def format_full_global_results(data):
-        if not isinstance(data, dict): return "❌ خطا در داده‌های دریافتی"
-        flags = {
-            'us': '🇺🇸', 'fr': '🇫🇷', 'de': '🇩🇪', 'nl': '🇳🇱', 'uk': '🇬🇧', 'ru': '🇷🇺',
-            'ca': '🇨🇦', 'tr': '🇹🇷', 'ua': '🇺🇦', 'ir': '🇮🇷', 'ae': '🇦🇪', 'in': '🇮🇳',
-            'cn': '🇨🇳', 'jp': '🇯🇵', 'kr': '🇰🇷', 'br': '🇧🇷', 'it': '🇮🇹', 'es': '🇪🇸',
-            'au': '🇦🇺', 'sg': '🇸🇬', 'hk': '🇭🇰', 'ch': '🇨🇭', 'se': '🇸🇪', 'fi': '🇫🇮'
-        }
-        lines = []
-        for node, result in data.items():
-            if not result or not result[0]: continue 
-            country_code = node[:2].lower()
-            flag = flags.get(country_code, '🌍')
-            rtts = [p[1] * 1000 for p in result[0] if p[0] == "OK"]
-            if rtts:
-                avg = int(sum(rtts) / len(rtts))
-                status = "🟢" if avg < 100 else "🟡" if avg < 200 else "🔴"
-                lines.append(f"{flag} `{node.ljust(12)}` : {status} **{avg}ms**")
-            else:
-                lines.append(f"{flag} `{node.ljust(12)}` : ❌ Timeout")
-        if not lines: return "⚠️ نتیجه‌ای دریافت نشد."
-        lines.sort(key=lambda x: 0 if '🇮🇷' in x else 1)
-        return "\n".join(lines)
-
-    @staticmethod
-    def get_datacenter_info(ip):
-        try:
-            url = f"https://api.iplocation.net/?ip={ip}"
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('response_code') == '200':
-                    return True, data
-                else:
-                    return False, data.get('response_message', 'API Error')
-            else:
-                return False, f"HTTP Error: {response.status_code}"
-        except Exception as e:
-            return False, str(e)
-
-    @staticmethod
-    def format_iran_ping_stats(check_host_data):
-        if not isinstance(check_host_data, dict): 
-            return "\n   ❌ خطا در دریافت پینگ ایران"
-        node_map = {
-            'ir1': 'Tehran (MCI)', 'ir-thr': 'Tehran (Datacenter)',
-            'ir3': 'Karaj (Asiatech)', 'ir-krj': 'Karaj (Asiatech)',
-            'ir4': 'Shiraz (ParsOnline)', 'ir-shz': 'Shiraz (ParsOnline)',
-            'ir5': 'Mashhad (Ferdowsi)', 'ir-mhd': 'Mashhad (Ferdowsi)',
-            'ir6': 'Esfahan (Mokhaberat)', 'ir-ifn': 'Esfahan (Mokhaberat)',
-            'ir2': 'Tabriz (Shatel)', 'ir-tbz': 'Tabriz (IT)'
-        }
-        lines = []
-        for node, result in check_host_data.items():
-            node_key = node.split('.')[0].lower()
-            if 'ir' not in node_key: continue
-            city_name = node_map.get(node_key, 'Iran (Unknown)')
-            if not result or not result[0]:
-                lines.append(f"🔴 {city_name}: Timeout")
-                continue
-            rtts = [p[1] * 1000 for p in result[0] if p[0] == "OK"]
-            if rtts:
-                avg_ping = sum(rtts) / len(rtts)
-                status_icon = "🟢" if avg_ping < 100 else "🟡" if avg_ping < 200 else "🔴"
-                lines.append(f"{status_icon} {city_name}: {avg_ping:.0f} ms")
-            else:
-                lines.append(f"🔴 {city_name}: Packet Loss")
-        if not lines: return "\n   ⚠️ هیچ نود فعالی در ایران یافت نشد."
-        return "\n" + "\n".join([f"   {line}" for line in lines])
-
-    @staticmethod
-    def make_bar(percentage, length=10):
-        if not isinstance(percentage, (int, float)):
-            percentage = 0
-        blocks = "▏▎▍▌▋▊▉█"
-        if percentage < 0: percentage = 0
-        if percentage > 100: percentage = 100
-        full_blocks = int((percentage / 100) * length)
-        remainder = (percentage / 100) * length - full_blocks
-        idx = int(remainder * len(blocks))
-        
-        if idx >= len(blocks): idx = len(blocks) - 1
-        
-        bar = "█" * full_blocks
-        if full_blocks < length: bar += blocks[idx] + " " * (length - full_blocks - 1)
-        return bar
-
-    @staticmethod
-    def check_full_stats(ip, port, user, password):
-        client = None
-        try:
-            client = ServerMonitor.get_ssh_client(ip, port, user, password)
-            commands = [
-                "grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {print usage}'", 
-                "free -m | awk 'NR==2{printf \"%.2f\", $3*100/$2 }'", 
-                "df -h / | awk 'NR==2{print $5}' | tr -d '%'", 
-                "uptime -p", 
-                "cat /proc/uptime | awk '{print $1}'", 
-                "cat /proc/net/dev | awk 'NR>2 {rx+=$2; tx+=$10} END {print rx+tx}'",
-                "who | awk '{print $1 \"_\" $5}'"
-            ]
-            results = []
-            for cmd in commands:
-                try:
-                    _, stdout, _ = client.exec_command(cmd, timeout=5)
-                    out = stdout.read().decode().strip()
-                    results.append(out if out else "0")
-                except: results.append("0")
-            client.close()
-            
-            try:
-                uptime_sec = float(results[4]) if results[4].replace('.','',1).isdigit() else 0
-            except ValueError: uptime_sec = 0
-
-            traffic_bytes = int(results[5]) if results[5].isdigit() else 0
-            traffic_gb = round(traffic_bytes / (1024**3), 2)
-            uptime_str = results[3].replace('up ', '').replace('weeks', 'w').replace('days', 'd').replace('hours', 'h').replace('minutes', 'm')
-            
-            try: cpu_val = round(float(results[0]), 1)
-            except: cpu_val = 0.0
-            try: ram_val = round(float(results[1]), 1)
-            except: ram_val = 0.0
-            try: disk_val = int(results[2])
-            except: disk_val = 0
-            who_data = results[6].split('\n') if results[6] != "0" else []
-            current_sessions = [line.strip().replace('(', '').replace(')', '') for line in who_data if line.strip()]
-            return {
-                'status': 'Online', 'cpu': cpu_val, 'ram': ram_val, 'disk': disk_val, 
-                'uptime_str': uptime_str, 'uptime_sec': uptime_sec, 'traffic_gb': traffic_gb, 
-                'ssh_sessions': current_sessions,
-                'error': None
-            }
-        except Exception as e:
-            if client: 
-                try: client.close()
-                except: pass
-            return {'status': 'Offline', 'error': str(e)[:50], 'uptime_sec': 0, 'traffic_gb': 0, 'ssh_sessions': []}
-
-    @staticmethod
-    def run_remote_command(ip, port, user, password, command, timeout=60):
-        client = None
-        try:
-            client = ServerMonitor.get_ssh_client(ip, port, user, password)
-            full_cmd = f"export DEBIAN_FRONTEND=noninteractive; {command}"
-            _, stdout, stderr = client.exec_command(full_cmd, timeout=timeout)
-            out = stdout.read().decode().strip()
-            err = stderr.read().decode().strip()
-            client.close()
-            return True, (out + "\n" + err).strip()
-        except Exception as e:
-            if client:
-                try: client.close()
-                except: pass
-            return False, str(e)
-
-    @staticmethod
-    def install_speedtest(ip, port, user, password):
-        cmd = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && (sudo DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli || (sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip && pip3 install --upgrade speedtest-cli))"
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
-
-    @staticmethod
-    def run_speedtest(ip, port, user, password):
-        return ServerMonitor.run_remote_command(ip, port, user, password, "speedtest-cli --simple", timeout=90)
-
-    @staticmethod
-    def clear_cache(ip, port, user, password):
-        return ServerMonitor.run_remote_command(ip, port, user, password, "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'", timeout=30)
-
-    # --- تابع جدید پاکسازی دیسک ---
-    @staticmethod
-    def clean_disk_space(ip, port, user, password):
-        try:
-            client = ServerMonitor.get_ssh_client(ip, port, user, password)
-            
-            # 1. محاسبه فضای مصرفی قبل از پاکسازی
-            _, stdout, _ = client.exec_command("df / --output=used | tail -n 1")
-            start_used = int(stdout.read().decode().strip())
-
-            # 2. اجرای دستورات پاکسازی
-            commands = (
-                "sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && "
-                "sudo DEBIAN_FRONTEND=noninteractive apt-get clean && "
-                "sudo journalctl --vacuum-time=3d && " 
-                "sudo rm -rf /var/log/*.gz /var/tmp/* /tmp/*"
-            )
-            
-            # اجرا و صبر برای اتمام
-            chan = client.get_transport().open_session()
-            chan.exec_command(commands)
-            chan.recv_exit_status() # این خط صبر می‌کند تا دستور تمام شود
-            
-            # 3. محاسبه فضای مصرفی بعد از پاکسازی
-            _, stdout, _ = client.exec_command("df / --output=used | tail -n 1")
-            end_used = int(stdout.read().decode().strip())
-            
-            client.close()
-            
-            # محاسبه مقدار آزاد شده
-            freed_kb = start_used - end_used
-            if freed_kb < 0: freed_kb = 0
-            freed_mb = freed_kb / 1024
-            
-            return True, freed_mb
-        except Exception as e:
-            return False, str(e)
-
-    @staticmethod
-    def set_dns(ip, port, user, password, dns_type):
-        dns_map = {
-            "google": "nameserver 8.8.8.8\nnameserver 8.8.4.4", 
-            "cloudflare": "nameserver 1.1.1.1\nnameserver 1.0.0.1", 
-            "shecan": "nameserver 178.22.122.100\nnameserver 185.51.200.2"
-        }
-        if dns_type not in dns_map: return False, "Invalid DNS"
-        return ServerMonitor.run_remote_command(ip, port, user, password, f"echo '{dns_map[dns_type]}' | sudo tee /etc/resolv.conf", timeout=30)
-
-    @staticmethod
-    def full_system_update(ip, port, user, password):
-        cmd = (
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get clean"
-        )
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=900)
-
-    @staticmethod
-    def repo_update(ip, port, user, password):
-        cmd = (
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-        )
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
-
-    @staticmethod
-    def check_host_api(target):
-        try:
-            headers = {'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'}
-            url = f"https://check-host.net/check-ping?host={target}&max_nodes=50"
-            req = requests.get(url, headers=headers, timeout=10)
-            if req.status_code != 200: return False, f"API Error: {req.status_code}"
-            request_id = req.json().get('request_id')
-            result_url = f"https://check-host.net/check-result/{request_id}"
-            poll_data = {}
-            for _ in range(8):
-                time.sleep(2.5)
-                res_req = requests.get(result_url, headers=headers, timeout=10)
-                poll_data = res_req.json()
-                if isinstance(poll_data, dict):
-                    completed = sum(1 for k, v in poll_data.items() if v)
-                    if completed >= 10: break
-            return True, poll_data
-        except Exception as e: return False, str(e)
-
-    @staticmethod
-    def format_check_host_results(data):
-        if not isinstance(data, dict): return "❌ داده نامعتبر"
-        ir_city_map = {
-            'ir1': 'Tehran', 'ir-thr': 'Tehran', 'ir-teh': 'Tehran', 
-            'ir3': 'Karaj', 'ir-krj': 'Karaj', 'ir4': 'Shiraz', 'ir-shz': 'Shiraz', 
-            'ir5': 'Mashhad', 'ir-mhd': 'Mashhad', 'ir6': 'Esfahan', 'ir-ifn': 'Esfahan', 
-            'ir2': 'Tabriz', 'ir-tbz': 'Tabriz'
-        }
-        rows = []
-        has_iran = False
-        for node, result in data.items():
-            if not result or not isinstance(result, list) or len(result) == 0 or not result[0]: continue
-            try:
-                if node[:2].lower() != 'ir': continue
-                has_iran = True
-                node_clean = node.split('.')[0].lower()
-                city_name = "Tehran"
-                for key, val in ir_city_map.items():
-                    if key in node_clean:
-                        city_name = val
-                        break
-                location_display = f"🇮🇷 Iran, {city_name}"
-                packets = result[0]
-                total_packets = len(packets)
-                ok_packets = 0
-                rtts = []
-                for p in packets:
-                    if p[0] == "OK":
-                        ok_packets += 1
-                        rtts.append(p[1] * 1000)
-                packet_stat = f"{ok_packets}/{total_packets}"
-                if rtts:
-                    ping_stat = f"{min(rtts):.0f} / {statistics.mean(rtts):.0f} / {max(rtts):.0f}"
-                else: ping_stat = "Timeout"
-                line = f"`{location_display.ljust(17)}`|`{packet_stat}`| `{ping_stat}`"
-                rows.append(line)
-            except Exception as e: continue
-        if not has_iran: return "⚠️ هیچ سرور فعالی از ایران یافت نشد."
-        return "🌍 **Check-Host (Iran Only)**\n`Location         | Pkts| Latency (m/a/x)`\n" + "─"*48 + "\n" + "\n".join(rows)
-
-
-def generate_plot(server_name, stats):
-    if not stats:
-        return None
-    try:
-        fig = Figure(figsize=(10, 5))
-        ax = fig.add_subplot(111)
-        
-        times = [s['time_str'] for s in stats]
-        cpus = [s['cpu'] for s in stats]
-        rams = [s['ram'] for s in stats]
-        
-        ax.plot(times, cpus, label='CPU (%)', color='red', linewidth=2)
-        ax.plot(times, rams, label='RAM (%)', color='blue', linewidth=2)
-        
-        ax.set_title(f"Server Monitor: {server_name} (Last 24h)")
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Usage %')
-        ax.set_ylim(0, 100)
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.6)
-        
-        if len(times) > 10:
-            step = max(1, len(times)//8)
-            ax.set_xticks(range(0, len(times), step))
-            ax.set_xticklabels(times[::step], rotation=45)
-        
-        fig.tight_layout()
-        buf = io.BytesIO()
-        FigureCanvasAgg(fig).print_png(buf)
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        logger.error(f"Plot error: {e}")
-        return None
-
-
-# ==============================================================================
-# 🎮 UI HELPERS & GENERAL HANDLERS
-# ==============================================================================
-def get_cancel_markup():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 انصراف", callback_data='cancel_flow')]])
-
-async def safe_edit_message(update: Update, text, reply_markup=None, parse_mode='Markdown'):
-    try:
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-        elif update.message:
-            await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except BadRequest: pass
-    except Exception as e: logger.error(f"Edit Error: {e}")
-
-
-async def run_background_ssh_task(context: ContextTypes.DEFAULT_TYPE, chat_id, func, *args):
-    loop = asyncio.get_running_loop()
-    try:
-        ok, output = await loop.run_in_executor(None, func, *args)
-        clean_out = html.escape(str(output))
-        if len(clean_out) > 3500: 
-            clean_out = clean_out[:3500] + "\n... (Output Truncated)"
-        
-        status_icon = "✅ عملیات با موفقیت انجام شد." if ok else "❌ عملیات با خطا مواجه شد."
-        msg_text = (
-            f"{status_icon}\n"
-            f"➖➖➖➖➖➖➖➖➖➖\n"
-            f"<pre>{clean_out}</pre>"
-        )
-        await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='HTML')
-        
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ خطای غیرمنتظره در عملیات پس‌زمینه:\n{e}")    
-
-async def cancel_handler_func(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query: 
-        try: await update.callback_query.answer()
-        except: pass
-    await safe_edit_message(update, "🚫 **عملیات لغو شد.**")
-    await asyncio.sleep(1)
-    await start(update, context)
-    return ConversationHandler.END
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Exception while handling an update:", exc_info=context.error)
-    if isinstance(context.error, Conflict):
-        logger.critical("⚠️ Conflict detected: Another instance is running. Shutting down.")
-        os._exit(1) 
-    if isinstance(update, Update) and update.effective_message:
-        try:
-            await update.effective_message.reply_text("❌ خطای داخلی سیستم. لطفاً دوباره تلاش کنید.")
-        except: pass
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    full_name = update.effective_user.full_name
-    username = update.effective_user.username or "ندارد"
-    context.user_data.clear()
-    loop = asyncio.get_running_loop()
-
-    # --- بررسی دعوت ---
-    args = context.args  # پارامترهای لینک (مثلا /start 12345)
-    inviter_id = 0
     
-    # چک می‌کنیم کاربر قبلاً عضو نبوده باشد
+    if user_id in USER_ACTIVE_TASKS:
+        task = USER_ACTIVE_TASKS[user_id]
+        if not task.done():
+            task.cancel()
+            try: await task
+            except asyncio.CancelledError: pass
+        del USER_ACTIVE_TASKS[user_id]
+    
+    context.user_data.clear()
+    await register_user_logic(update, context)
+
+    if not cronjobs.IS_SYSTEM_INITIALIZED:
+        asyncio.create_task(cronjobs.silent_update_monitor_agent())
+        cronjobs.IS_SYSTEM_INITIALIZED = True
+
+    await show_main_menu(update, context)
+    return ConversationHandler.END
+
+async def register_user_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    full_name = update.effective_user.full_name
+    loop = asyncio.get_running_loop()
+    args = context.args 
+    inviter_id = 0
+
     existing_user = await loop.run_in_executor(None, db.get_user, user_id)
     is_new_user = False if existing_user else True
 
-    if is_new_user and args and args[0].isdigit():
+    if is_new_user and user_id != SUPER_ADMIN_ID and args and args[0].isdigit():
         possible_inviter = int(args[0])
-        # کاربر نمی‌تواند خودش را دعوت کند
         if possible_inviter != user_id:
-            # چک می‌کنیم معرف وجود دارد؟
             inviter_exists = await loop.run_in_executor(None, db.get_user, possible_inviter)
             if inviter_exists:
                 inviter_id = possible_inviter
 
-    # ثبت نام کاربر (با آیدی معرف اگر وجود داشت)
     await loop.run_in_executor(None, db.add_or_update_user, user_id, full_name, inviter_id)
-    
-    # --- سیستم جایزه دهی ---
+
+    if user_id == SUPER_ADMIN_ID: return
+
     if is_new_user:
-        # 1. اطلاع به ادمین کل
         try:
-            admin_msg = f"🔔 **کاربر جدید!**\n👤 {full_name}\n🆔 `{user_id}`\n🔗 دعوت شده توسط: `{inviter_id if inviter_id else 'لینک مستقیم'}`"
+            admin_msg = f"🔔 **کاربر جدید!**\n👤 {full_name}\n🆔 `{user_id}`\n🔗 دعوت: `{inviter_id if inviter_id else 'مستقیم'}`"
             await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=admin_msg, parse_mode='Markdown')
         except: pass
 
-        # 2. اگر معرف داشت، جایزه را اعمال کن
         if inviter_id != 0:
             ok, new_lim, new_exp = await loop.run_in_executor(None, db.apply_referral_reward, inviter_id)
             if ok:
                 try:
-                    # پیام تبریک به معرف
                     await context.bot.send_message(
                         chat_id=inviter_id,
-                        text=(
-                            f"🎉 **تبریک! یک زیرمجموعه جدید جذب کردید.**\n\n"
-                            f"👤 کاربر: {full_name}\n"
-                            f"🎁 **پاداش شما:**\n"
-                            f"➕ 1 عدد به ظرفیت سرور (مجموع: {new_lim})\n"
-                            f"➕ 10 روز به اعتبار اشتراک (تاریخ جدید: {new_exp})"
-                        )
+                        text=(f"🎉 **تبریک! زیرمجموعه جدید:** {full_name}\n🎁 **پاداش:** +1 سرور (مجموع: {new_lim}) | +10 روز اعتبار")
                     )
                 except: pass
 
-        # 3. پیام خوش‌آمدگویی
-        await update.message.reply_text(
-            f"🎉 **سلام {full_name} عزیز، خوش اومدی!** \n\n"
-            "✅ حساب شما ایجاد شد:\n"
-            "🔹 **اعتبار اولیه:** 60 روز\n"
-            "🔹 **ظرفیت سرور:** 2 عدد\n\n"
-            "می‌تونی با دعوت دوستانت، این محدودیت‌ها رو رایگان افزایش بدی! 🚀",
-            parse_mode='Markdown'
-        )
+        try:
+            await update.message.reply_text(
+                f"🎉 **سلام {full_name} عزیز، خوش اومدی!** \n\n✅ حساب شما ایجاد شد:\n🔹 **اعتبار اولیه:** 60 روز\n🔹 **ظرفیت سرور:** 2 عدد\n\nمی‌تونی با دعوت دوستانت، این محدودیت‌ها رو رایگان افزایش بدی! 🚀",
+                parse_mode='Markdown'
+            )
+        except: pass
 
-    # --- ادامه کد استارت مثل قبل ---
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    full_name = update.effective_user.full_name
+    loop = asyncio.get_running_loop()
+    
     has_access, msg = await loop.run_in_executor(None, db.check_access, user_id)
     if not has_access:
-        await update.effective_message.reply_text(f"⛔️ دسترسی مسدود است: {msg}")
+        msg_text = f"⛔️ دسترسی مسدود است: {msg}"
+        if update.callback_query: await safe_edit_message(update, msg_text)
+        else: await update.message.reply_text(msg_text)
         return
-    
-    remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
-    
-    # منوی اصلی با دکمه‌های جدید کیف پول و دعوت
-    kb = [
-        [InlineKeyboardButton("👤 حساب کاربری", callback_data='user_profile'), InlineKeyboardButton("💰 کیف پول & خرید", callback_data='wallet_menu')],
-        [InlineKeyboardButton("🤝 دعوت از دوستان (رایگان)", callback_data='referral_menu')], 
-        [InlineKeyboardButton("📂 گروه‌بندی", callback_data='groups_menu'), InlineKeyboardButton("➕ سرور جدید", callback_data='add_server')],
-        [InlineKeyboardButton("📋 لیست سرورها", callback_data='list_groups_for_servers'), InlineKeyboardButton("📊 داشبورد شبکه", callback_data='status_dashboard')],
-        [InlineKeyboardButton("🌍 تنظیمات همگانی", callback_data='global_ops_menu'), InlineKeyboardButton("⚙️ تنظیمات", callback_data='settings_menu')]
-    ]
-    if user_id == SUPER_ADMIN_ID: 
-        kb.insert(0, [InlineKeyboardButton("🤖 مدیریت ربات", callback_data='admin_panel_main')])
 
-    txt = (
-        f"👋 **درود {full_name} عزیز**\n"
-        f"🦇 **Sonar Radar Ultra Pro**\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📅 اعتبار: `{remaining}`\n"
-        f"🔰 گزینه مورد نظر را انتخاب کنید:"
-    )
-    
+    remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
+    is_monitor_ready = await loop.run_in_executor(None, db.is_monitor_active)
+    reply_markup = keyboard.main_menu_kb(user_id, is_monitor_ready, SUPER_ADMIN_ID)
+
+    txt = (f"👋 **درود {full_name} عزیز، خوش آمدید!** 🌹\n🦇 **Sonar Radar Ultra Pro**\n➖➖➖➖➖➖➖➖➖➖\n✅ سیستم آماده‌سازی شد.\n📅 اعتبار شما: `{remaining}`\n🔰 گزینه مورد نظر را انتخاب کنید:")
+
     if update.callback_query:
-        await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+        await safe_edit_message(update, txt, reply_markup=reply_markup)
     else:
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    return ConversationHandler.END
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE): await start(update, context)
+        await update.message.reply_text(txt, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_main_menu(update, context)
+
 async def user_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query: 
+    if update.callback_query:
         try: await update.callback_query.answer()
         except: pass
+    
     uid = update.effective_user.id
     user = db.get_user(uid)
-    
+
     if not user:
         await safe_edit_message(update, "❌ کاربر یافت نشد.")
         return
@@ -1125,9 +249,8 @@ async def user_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         join_date = datetime.strptime(user['added_date'], '%Y-%m-%d %H:%M:%S')
         j_join = jdatetime.date.fromgregorian(date=join_date.date())
-        join_str = f"{j_join.day} {jdatetime.date.j_months_fa[j_join.month-1]} {j_join.year}"
-    except:
-        join_str = "نامشخص"
+        join_str = f"{j_join.day} {jdatetime.date.j_months_fa[j_join.month - 1]} {j_join.year}"
+    except: join_str = "نامشخص"
 
     access, time_left = db.check_access(uid)
     if uid == SUPER_ADMIN_ID:
@@ -1141,312 +264,104 @@ async def user_profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     srv_count = len(servers)
     active_srv = sum(1 for s in servers if s['is_active'])
 
-    txt = (
-        f"👤 **پروفایل کاربری شما**\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"🏷 **نام:** `{user['full_name']}`\n"
-        f"🆔 **آیدی عددی:** `{user['user_id']}`\n"
-        f"📅 **تاریخ عضویت:** `{join_str}`\n\n"
-        
-        f"💳 **نوع اشتراک:** {sub_type}\n"
-        f"⏳ **اعتبار باقی‌مانده:** `{expiry_str}`\n"
-        f"🔢 **سقف مجاز سرور:** `{user['server_limit']} عدد`\n\n"
-        
-        f"🖥 **وضعیت سرورها:**\n"
-        f"   ├ 🟢 فعال: `{active_srv}`\n"
-        f"   └ ⚪️ کل ثبت شده: `{srv_count}`"
-    )
-
-    kb = [
-        [InlineKeyboardButton("🔑 دریافت توکن پنل وب (Web Token)", callback_data='gen_web_token')],
-        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    txt = (f"👤 **پروفایل کاربری شما**\n➖➖➖➖➖➖➖➖➖➖\n🏷 **نام:** `{user['full_name']}`\n🆔 **آیدی عددی:** `{user['user_id']}`\n📅 **تاریخ عضویت:** `{join_str}`\n\n💳 **نوع اشتراک:** {sub_type}\n⏳ **اعتبار باقی‌مانده:** `{expiry_str}`\n🔢 **سقف مجاز سرور:** `{user['server_limit']} عدد`\n\n🖥 **وضعیت سرورها:**\n   ├ 🟢 فعال: `{active_srv}`\n   └ ⚪️ کل ثبت شده: `{srv_count}`")
+    reply_markup = keyboard.user_profile_kb()
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
 
 async def web_token_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await update.callback_query.answer("🚧 پنل تحت وب در حال توسعه است.\nبه زودی این قابلیت فعال می‌شود!", show_alert=True)
     except: pass
 
-
 # ==============================================================================
 # 👑 ADMIN PANEL HANDLERS
 # ==============================================================================
-async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != SUPER_ADMIN_ID: return
-    
-    users_count = len(db.get_all_users())
-    with db.get_connection() as conn:
-        total_servers = len(conn.execute('SELECT id FROM servers').fetchall())
-    
-    kb = [
-        [InlineKeyboardButton("👥 مدیریت کاربران", callback_data='admin_users_page_1')],
-        [InlineKeyboardButton("➕ افزودن دستی کاربر", callback_data='add_new_admin')],
-        [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data='admin_broadcast_start')],
-        [InlineKeyboardButton("🔎 جستجوی کاربر", callback_data='admin_search_start'), InlineKeyboardButton("📄 لیست متنی", callback_data='admin_users_text')],
-        [InlineKeyboardButton("📥 دریافت بکاپ", callback_data='admin_backup_get'), InlineKeyboardButton("📤 بازنشانی بکاپ", callback_data='admin_backup_restore_start')],
-        [InlineKeyboardButton("🔑 دریافت کلید (Backup Key)", callback_data='admin_key_backup_get'), InlineKeyboardButton("🗝 بازیابی کلید (Restore Key)", callback_data='admin_key_restore_start')
-        ],
-        [InlineKeyboardButton("💳 تنظیمات پرداخت و ولت", callback_data='admin_pay_settings')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
-    ]
-    
-    txt = (
-        f"🤖 **پنل مدیریت ربات**\n\n"
-        f"📊 **آمار کلی:**\n"
-        f"👤 کل کاربران: `{users_count}`\n"
-        f"🖥 کل سرورهای ثبت شده: `{total_servers}`"
-    )
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def admin_users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    page = int(update.callback_query.data.split('_')[-1])
-    users, total_count = db.get_all_users_paginated(page, 5)
-    total_pages = (total_count + 4) // 5
-    
-    txt = f"👥 **لیست کاربران (صفحه {page} از {total_pages})**\nتعداد کل: `{total_count}`\n➖➖➖➖➖➖"
-    
-    kb = []
-    for u in users:
-        status = "🔴" if u['is_banned'] else "🟢"
-        name = u['full_name'] if u['full_name'] else "Unknown"
-        kb.append([InlineKeyboardButton(f"{status} {name} | {u['user_id']}", callback_data=f"admin_u_manage_{u['user_id']}")])
-    
-    nav_btns = []
-    if page > 1: nav_btns.append(InlineKeyboardButton("◀️ قبلی", callback_data=f'admin_users_page_{page-1}'))
-    if page < total_pages: nav_btns.append(InlineKeyboardButton("بعدی ▶️", callback_data=f'admin_users_page_{page+1}'))
-    
-    if nav_btns: kb.append(nav_btns)
-    kb.append([InlineKeyboardButton("🔙 بازگشت به مدیریت", callback_data='admin_panel_main')])
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def admin_user_manage(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id=None):
-    if not user_id and update.callback_query:
-        data = update.callback_query.data
-        if "manage_" in data:
-            try:
-                user_id = int(data.split('_')[-1])
-            except: pass
-    
-    if not user_id:
-        await safe_edit_message(update, "❌ خطای سیستمی: آیدی کاربر پیدا نشد.")
-        return
-
-    user = db.get_user(user_id)
-    if not user:
-        await safe_edit_message(update, "❌ کاربر در دیتابیس یافت نشد.")
-        return
-
-    plan_txt = "💎 پریمیوم (VIP)" if user['plan_type'] == 1 else "👤 عادی (Normal)"
-    plan_action = "تبدیل به عادی ⬇️" if user['plan_type'] == 1 else "ارتقا به پریمیوم 💎"
-    ban_status = "🔴 مسدود" if user['is_banned'] else "🟢 فعال"
-    
-    txt = (
-        f"👤 **مدیریت کاربر:** `{user['full_name']}`\n"
-        f"🆔 آیدی: `{user['user_id']}`\n"
-        f"💳 **نوع اشتراک:** {plan_txt}\n"
-        f"📆 انقضا: `{user['expiry_date']}`\n"
-        f"📡 وضعیت: {ban_status}\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📊 سرورها: `{len(db.get_all_user_servers(user_id))}` / `{user['server_limit']}`"
-    )
-    
-    kb = [
-        [InlineKeyboardButton("➕ تمدید (30 روز)", callback_data=f'admin_u_addtime_{user_id}'), InlineKeyboardButton("📅 تنظیم زمان دستی", callback_data=f'admin_u_settime_{user_id}')],
-        [InlineKeyboardButton(plan_action, callback_data=f'admin_u_toggleplan_{user_id}')], 
-        [InlineKeyboardButton("🔢 تغییر لیمیت سرور", callback_data=f'admin_u_limit_{user_id}')],
-        [InlineKeyboardButton("مسدود/رفع مسدود", callback_data=f'admin_u_ban_{user_id}'), InlineKeyboardButton("🗑 حذف", callback_data=f'admin_u_del_{user_id}')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='admin_users_page_1')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def admin_user_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    action = data.split('_')[2]
-    target_id = int(data.split('_')[3])
-    
-    if action == 'ban':
-        new_state = db.toggle_ban_user(target_id)
-        msg = "کاربر مسدود شد." if new_state else "کاربر فعال شد."
-        try: await update.callback_query.answer(msg)
-        except: pass
-        await admin_user_manage(update, context, user_id=target_id)
-        
-    elif action == 'del':
-        db.remove_user(target_id)
-        try: await update.callback_query.answer("کاربر حذف شد.")
-        except: pass
-        await admin_users_list(update, context)
-        
-    elif action == 'addtime':
-        db.add_or_update_user(target_id, days=30)
-        try: await update.callback_query.answer("30 روز تمدید شد.")
-        except: pass
-        await admin_user_manage(update, context, user_id=target_id)
-
-    elif action == 'limit':
-        context.user_data['target_uid'] = target_id
-        await safe_edit_message(update, "🔢 **تعداد جدید محدودیت سرور را وارد کنید:**", reply_markup=get_cancel_markup())
-        return ADMIN_SET_LIMIT
-        
-    elif action == 'settime':
-        context.user_data['target_uid'] = target_id
-        await safe_edit_message(update, "📅 **تعداد روز اعتبار را وارد کنید (مثلا 60):**", reply_markup=get_cancel_markup())
-        return ADMIN_SET_TIME_MANUAL
-    elif action == 'toggleplan':
-        new_plan = db.toggle_user_plan(target_id)
-        msg = "✅ کاربر به پریمیوم ارتقا یافت (لیمیت: 10)" if new_plan == 1 else "⬇️ کاربر به عادی تغییر یافت (لیمیت: 2)"
-        try: await update.callback_query.answer(msg, show_alert=True)
-        except: pass
-        await admin_user_manage(update, context, user_id=target_id)
-
-async def admin_set_limit_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        lim = int(update.message.text)
-        target_id = context.user_data.get('target_uid')
-        db.update_user_limit(target_id, lim)
-        await update.message.reply_text(f"✅ محدودیت سرور به {lim} تغییر یافت.")
-        await admin_user_manage(update, context, user_id=target_id)
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ لطفاً فقط عدد انگلیسی وارد کنید.")
-        return ADMIN_SET_LIMIT
-
-async def admin_set_days_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        days = int(update.message.text)
-        target_id = context.user_data.get('target_uid')
-        db.add_or_update_user(target_id, days=days)
-        await update.message.reply_text(f"✅ اعتبار کاربر {days} روز تمدید شد.")
-        await admin_user_manage(update, context, user_id=target_id)
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ لطفاً فقط عدد انگلیسی وارد کنید.")
-        return ADMIN_SET_TIME_MANUAL
-
-async def admin_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🔎 **آیدی عددی کاربر را ارسال کنید:**", reply_markup=get_cancel_markup())
-    return ADMIN_SEARCH_USER
-
-async def admin_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        tid = int(update.message.text)
-        user = db.get_user(tid)
-        if user:
-            await admin_user_manage(update, context, user_id=tid)
-            return ConversationHandler.END
-        else:
-            await update.message.reply_text("❌ کاربر یافت نشد. مجدد تلاش کنید یا انصراف دهید.")
-            return ADMIN_SEARCH_USER
-    except:
-        await update.message.reply_text("❌ فرمت نامعتبر.")
-        return ADMIN_SEARCH_USER
-
-async def admin_users_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_users()
-    txt = "📋 **لیست کل کاربران:**\n\n"
-    for u in users:
-        txt += f"🆔 {u['user_id']} | 👤 {u['full_name']} | 📅 Exp: {u['expiry_date']}\n"
-    
-    if len(txt) > 4000:
-        with open("users_list.txt", "w", encoding='utf-8') as f: f.write(txt)
-        try: await update.callback_query.message.reply_document(document=open("users_list.txt", "rb"), caption="لیست کاربران")
-        except: pass
-        os.remove("users_list.txt")
-    else:
-        await update.callback_query.message.reply_text(txt)
-
-# --- Backup & Restore ---
 async def admin_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer("در حال ارسال فایل...")
+    """دریافت بکاپ دستی Postgres"""
+    try: await update.callback_query.answer("⏳ در حال تهیه بکاپ...")
     except: pass
-    with db.get_connection() as conn:
-        conn.execute("PRAGMA wal_checkpoint(FULL);")
-    await update.callback_query.message.reply_document(document=open(DB_NAME, 'rb'), caption=f"📦 Backup: {get_jalali_str()}")
 
+    timestamp = get_tehran_datetime().strftime("%Y-%m-%d_%H-%M")
+    backup_file = f"manual_backup_{timestamp}.sql"
+
+    try:
+        env = os.environ.copy()
+        env['PGPASSWORD'] = DB_CONFIG['password']
+
+        cmd = [
+            "pg_dump", "-h", DB_CONFIG['host'], "-U", DB_CONFIG['user'],
+            "-d", DB_CONFIG['dbname'], "-f", backup_file
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+        await proc.wait()
+
+        if proc.returncode == 0:
+            await update.callback_query.message.reply_document(
+                document=open(backup_file, 'rb'),
+                caption=f"📦 Manual Backup: {get_jalali_str()}"
+            )
+        else:
+            await update.callback_query.message.reply_text("❌ خطا در تهیه بکاپ.")
+            
+    except Exception as e:
+        await update.callback_query.message.reply_text(f"❌ خطا: {e}")
+    finally:
+        if os.path.exists(backup_file): os.remove(backup_file)
 async def admin_backup_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "⚠️ **هشدار:** با آپلود فایل جدید، دیتابیس فعلی حذف و جایگزین می‌شود.\n\n📂 **فایل .db خود را ارسال کنید:**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "⚠️ **هشدار:** با آپلود فایل جدید، دیتابیس فعلی حذف و جایگزین می‌شود.\n\n📂 **فایل .db خود را ارسال کنید:**", reply_markup=keyboard.get_cancel_markup())
     return ADMIN_RESTORE_DB
 
-async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(
-        update, 
-        "📢 **لطفاً پیام خود را ارسال کنید:**\n\n"
-        "می‌توانید متن، عکس، ویدیو یا پیام فوروارد شده بفرستید.\n"
-        "این پیام برای **تمام کاربران** ربات ارسال خواهد شد.",
-        reply_markup=get_cancel_markup()
-    )
-    return GET_BROADCAST_MSG
-
-async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_users()
-    total = len(users)
-    success = 0
-    blocked = 0
-    
-    status_msg = await update.message.reply_text(f"⏳ در حال ارسال به {total} کاربر...")
-    
-    for user in users:
-        try:
-            await update.message.copy(chat_id=user['user_id'])
-            success += 1
-        except Exception:
-            blocked += 1
-        
-        if success % 20 == 0:
-            await asyncio.sleep(1)
-
-    await status_msg.edit_text(
-        f"✅ **پیام همگانی ارسال شد.**\n\n"
-        f"👥 کل کاربران: `{total}`\n"
-        f"✅ موفق: `{success}`\n"
-        f"🚫 ناموفق (بلاک/حذف): `{blocked}`"
-    )
-    
-    await admin_panel_main(update, context)
-    return ConversationHandler.END
-
 async def admin_backup_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بازگردانی دیتابیس Postgres از فایل SQL"""
     doc = update.message.document
-    if not doc.file_name.endswith('.db'):
-        await update.message.reply_text("❌ فرمت فایل باید .db باشد.")
+    # چک کردن پسوند فایل (باید sql باشد نه db)
+    if not (doc.file_name.endswith('.sql') or doc.file_name.endswith('.txt')):
+        await update.message.reply_text("❌ فرمت فایل نامعتبر است. لطفاً فایل `.sql` ارسال کنید.")
         return ADMIN_RESTORE_DB
-    
-    temp_name = "temp_restore.db"
+
+    temp_name = "temp_restore.sql"
     f = await doc.get_file()
     await f.download_to_drive(temp_name)
-    
+
+    msg = await update.message.reply_text("⏳ **در حال بازنشانی دیتابیس...**\n(این عملیات ممکن است کمی طول بکشد)")
+
     try:
-        if os.path.exists(DB_NAME):
-            os.remove(DB_NAME)
-        os.rename(temp_name, DB_NAME)
-        
-        # Re-initialize to ensure tables exist if backup was old
-        db.init_db()
-        
-        await update.message.reply_text("✅ دیتابیس با موفقیت بازنشانی شد.")
-        await start(update, context)
+        env = os.environ.copy()
+        env['PGPASSWORD'] = DB_CONFIG['password']
+
+        # دستور بازگردانی (psql)
+        # نکته: دیتابیس قبلی پاک نمی‌شود، بلکه روی آن نوشته می‌شود. 
+        # اگر می‌خواهید کامل جایگزین شود، باید ابتدا جداول را DROP کنید که کمی پیچیده است.
+        # این دستور استاندارد ریستور است:
+        cmd = [
+            "psql", "-h", DB_CONFIG['host'], "-U", DB_CONFIG['user'],
+            "-d", DB_CONFIG['dbname'], "-f", temp_name
+        ]
+
+        proc = await asyncio.create_subprocess_exec(*cmd, env=env)
+        await proc.wait()
+
+        if proc.returncode == 0:
+            await msg.edit_text("✅ **دیتابیس با موفقیت بازنشانی شد.**\nربات اکنون با داده‌های جدید کار می‌کند.")
+            await start(update, context)
+        else:
+            await msg.edit_text("❌ خطا در اجرای دستور psql.")
+
     except Exception as e:
-        await update.message.reply_text(f"❌ خطا در بازنشانی: {e}")
+        await msg.edit_text(f"❌ خطا در بازنشانی: {e}")
+    finally:
+        if os.path.exists(temp_name): os.remove(temp_name)
     
     return ConversationHandler.END
-# --- SECRET KEY HANDLERS ---
-
-# --- SECRET KEY HANDLERS ---
 async def admin_key_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not os.path.exists(KEY_FILE):
         try: await update.callback_query.answer("❌ فایل کلید یافت نشد!", show_alert=True)
         except: pass
         return
-    await update.callback_query.message.reply_document(
-        document=open(KEY_FILE, 'rb'), 
-        caption="🔑 **فایل کلید امنیتی (Secret Key)**\n⚠️ این فایل را برای روز مبادا نگه دارید."
-    )
+    await update.callback_query.message.reply_document(document=open(KEY_FILE, 'rb'), caption="🔑 **فایل کلید امنیتی (Secret Key)**\n⚠️ این فایل را برای روز مبادا نگه دارید.")
 
 async def admin_key_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🗝 **لطفاً فایل secret.key را ارسال کنید:**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "🗝 **لطفاً فایل secret.key را ارسال کنید:**", reply_markup=keyboard.get_cancel_markup())
     return ADMIN_RESTORE_KEY
 
 async def admin_key_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1454,58 +369,21 @@ async def admin_key_restore_handler(update: Update, context: ContextTypes.DEFAUL
     await f.download_to_drive("temp_key.key")
     if os.path.exists(KEY_FILE): os.remove(KEY_FILE)
     os.rename("temp_key.key", KEY_FILE)
-    global sec; sec = Security() # Reload Key
+    global sec
+    sec = Security()
     await update.message.reply_text("✅ **کلید امنیتی بازیابی شد!**")
     await start(update, context)
     return ConversationHandler.END
-# --- Add New User Handlers ---
-async def add_new_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer()
-    except: pass
-    await safe_edit_message(update, "👤 **شناسه عددی (User ID) کاربر را وارد کنید:**", reply_markup=get_cancel_markup())
-    return ADD_ADMIN_ID
 
-async def get_new_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data['new_uid'] = int(update.message.text)
-        await update.message.reply_text("📅 **تعداد روز اعتبار:**", reply_markup=get_cancel_markup())
-        return ADD_ADMIN_DAYS
-    except: 
-        await update.message.reply_text("❌ فقط عدد وارد کنید.")
-        return ADD_ADMIN_ID
-
-async def get_new_user_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        db.add_or_update_user(context.user_data['new_uid'], full_name="User (Manual)", days=int(update.message.text))
-        await update.message.reply_text("✅ کاربر افزوده شد.")
-        await start(update, context)
-        return ConversationHandler.END
-    except: 
-        await update.message.reply_text("❌ فقط عدد وارد کنید.")
-        return ADD_ADMIN_DAYS
 # ==============================================================================
 # 💳 PAYMENT SETTINGS (ADMIN)
 # ==============================================================================
-
 async def admin_payment_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """منوی مدیریت روش‌های پرداخت"""
     methods = db.get_payment_methods()
-    
-    txt = "💳 **مدیریت روش‌های پرداخت**\n\nلیست روش‌های فعال:\n"
-    if not methods:
-        txt += "❌ هیچ روش پرداختی تعریف نشده است."
-    
-    kb = []
-    for m in methods:
-        icon = "🏦" if m['type'] == 'card' else "💎"
-        kb.append([InlineKeyboardButton(f"🗑 حذف {icon} {m['network']}", callback_data=f'del_pay_method_{m["id"]}')])
-    
-    kb.append([InlineKeyboardButton("➕ افزودن کارت بانکی", callback_data='add_pay_method_card')])
-    kb.append([InlineKeyboardButton("➕ افزودن ولت کریپتو", callback_data='add_pay_method_crypto')])
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='admin_panel_main')])
-    
+    txt = "💳 **مدیریت روش‌های پرداخت**\n\nلیست روش‌های فعال:\n" + ("❌ هیچ روش پرداختی تعریف نشده است." if not methods else "")
+    reply_markup = keyboard.admin_pay_settings_kb(methods)
     if update.callback_query:
-        await safe_edit_message(update, txt + "\n\n👇 برای حذف روی دکمه‌ها بزنید.", reply_markup=InlineKeyboardMarkup(kb))
+        await safe_edit_message(update, txt + "\n\n👇 برای حذف روی دکمه‌ها بزنید.", reply_markup=reply_markup)
 
 async def delete_payment_method_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p_id = int(update.callback_query.data.split('_')[3])
@@ -1513,56 +391,31 @@ async def delete_payment_method_action(update: Update, context: ContextTypes.DEF
     await update.callback_query.answer("🗑 حذف شد.")
     await admin_payment_settings(update, context)
 
-# --- Add New Method Flow ---
 async def add_pay_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    p_type = update.callback_query.data.split('_')[3] # card or crypto
+    p_type = update.callback_query.data.split('_')[3]
     context.user_data['new_pay_type'] = p_type
-    
-    if p_type == 'card':
-        msg = "🏦 **نام بانک را وارد کنید:**\n(مثال: بانک ملت)"
-    else:
-        msg = "💎 **نام ارز و شبکه را وارد کنید:**\n(مثال: USDT - TRC20 یا TON)"
-        
-    await safe_edit_message(update, msg, reply_markup=get_cancel_markup())
+    msg = "🏦 **نام بانک را وارد کنید:**\n(مثال: بانک ملت)" if p_type == 'card' else "💎 **نام ارز و شبکه را وارد کنید:**\n(مثال: USDT - TRC20 یا TON)"
+    await safe_edit_message(update, msg, reply_markup=keyboard.get_cancel_markup())
     return ADD_PAY_NET
 
 async def get_pay_network(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['new_pay_net'] = update.message.text
     p_type = context.user_data['new_pay_type']
-    
-    if p_type == 'card':
-        msg = "🔢 **شماره کارت را وارد کنید:**"
-    else:
-        msg = "🔗 **آدرس ولت (Wallet Address) را ارسال کنید:**"
-        
-    await update.message.reply_text(msg, reply_markup=get_cancel_markup())
+    msg = "🔢 **شماره کارت را وارد کنید:**" if p_type == 'card' else "🔗 **آدرس ولت (Wallet Address) را ارسال کنید:**"
+    await update.message.reply_text(msg, reply_markup=keyboard.get_cancel_markup())
     return ADD_PAY_ADDR
 
 async def get_pay_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['new_pay_addr'] = update.message.text
-    
-    if context.user_data['new_pay_type'] == 'card':
-        msg = "👤 **نام صاحب حساب را وارد کنید:**"
-    else:
-        # برای کریپتو معمولا صاحب حساب لازم نیست، اما برای یکدستی دیتابیس چیزی میگیریم
-        msg = "📝 **توضیحات کوتاه یا نام ولت:**\n(مثال: ولت اصلی)"
-        
-    await update.message.reply_text(msg, reply_markup=get_cancel_markup())
+    msg = "👤 **نام صاحب حساب را وارد کنید:**" if context.user_data['new_pay_type'] == 'card' else "📝 **توضیحات کوتاه یا نام ولت:**\n(مثال: ولت اصلی)"
+    await update.message.reply_text(msg, reply_markup=keyboard.get_cancel_markup())
     return ADD_PAY_HOLDER
 
 async def get_pay_holder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     holder = update.message.text
     data = context.user_data
-    
     db.add_payment_method(data['new_pay_type'], data['new_pay_net'], data['new_pay_addr'], holder)
-    
     await update.message.reply_text("✅ **روش پرداخت با موفقیت اضافه شد.**")
-    # بازگشت به منوی پرداخت
-    class FakeUpdate:
-        def __init__(self, u): self.callback_query = u
-    
-    # اینجا یک تریک میزنیم که برگردیم به منو، اما چون مسیج هندلر هستیم باید دستی انجام بدیم
-    # ساده تر: لینک به پنل ادمین
     kb = [[InlineKeyboardButton("بازگشت به مدیریت پرداخت", callback_data='admin_pay_settings')]]
     await update.message.reply_text("جهت مشاهده لیست، دکمه زیر را بزنید:", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
@@ -1572,13 +425,11 @@ async def get_pay_holder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 async def groups_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     groups = db.get_user_groups(update.effective_user.id)
-    kb = [[InlineKeyboardButton(f"🗑 {g['name']}", callback_data=f'delgroup_{g["id"]}')] for g in groups]
-    kb.append([InlineKeyboardButton("➕ گروه جدید", callback_data='add_group')])
-    kb.append([InlineKeyboardButton("🔙", callback_data='main_menu')])
-    await safe_edit_message(update, "📂 Groups:", reply_markup=InlineKeyboardMarkup(kb))
+    reply_markup = keyboard.groups_menu_kb(groups)
+    await safe_edit_message(update, "📂 Groups:", reply_markup=reply_markup)
 
 async def add_group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "📝 Name:", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "📝 Name:", reply_markup=keyboard.get_cancel_markup())
     return GET_GROUP_NAME
 
 async def get_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1596,93 +447,49 @@ async def add_server_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID and srv_count >= user['server_limit']:
         await update.effective_message.reply_text("⛔️ **شما به سقف مجاز افزودن سرور رسیده‌اید.**")
         return ConversationHandler.END
-    await safe_edit_message(update, "🏷 **نام سرور را وارد کنید:**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "🏷 **نام سرور را وارد کنید:**", reply_markup=keyboard.get_cancel_markup())
     return GET_NAME
-# --- تعریف State جدید برای انتخاب روش ---
-# --- تعریف Stateهای جدید برای افزودن سرور ---
-SELECT_ADD_METHOD, GET_LINEAR_DATA = range(100, 102)
 
 async def add_server_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """منوی انتخاب روش افزودن سرور"""
     user = db.get_user(update.effective_user.id)
     srv_count = len(db.get_all_user_servers(update.effective_user.id))
-    
-    # چک کردن محدودیت کاربر
     if update.effective_user.id != SUPER_ADMIN_ID and srv_count >= user['server_limit']:
         await safe_edit_message(update, "⛔️ **شما به سقف مجاز افزودن سرور رسیده‌اید.**")
         return ConversationHandler.END
-
-    kb = [
-        [InlineKeyboardButton("🧙‍♂️ مرحله به مرحله (ویزارد)", callback_data='add_method_step')],
-        [InlineKeyboardButton("⚡️ افزودن سریع (خطی/چندگانه)", callback_data='add_method_linear')],
-        [InlineKeyboardButton("🔙 انصراف", callback_data='cancel_flow')]
-    ]
-    
-    txt = (
-        "➕ **افزودن سرور جدید**\n\n"
-        "لطفاً روش مورد نظر خود را انتخاب کنید:\n\n"
-        "1️⃣ **مرحله به مرحله:** ربات سوال می‌پرسد و شما پاسخ می‌دهید.\n"
-        "2️⃣ **سریع (خطی):** تمام اطلاعات را در یک پیام می‌فرستید (مناسب برای افزودن همزمان چند سرور)."
-    )
-    
-    if update.callback_query:
-        await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-        
+    reply_markup = keyboard.add_server_method_kb()
+    txt = "➕ **افزودن سرور جدید**\n\nلطفاً روش مورد نظر خود را انتخاب کنید:\n\n1️⃣ **مرحله به مرحله:** ربات سوال می‌پرسد و شما پاسخ می‌دهید.\n2️⃣ **سریع (خطی):** تمام اطلاعات را در یک پیام می‌فرستید (مناسب برای افزودن همزمان چند سرور)."
+    if update.callback_query: await safe_edit_message(update, txt, reply_markup=reply_markup)
+    else: await update.message.reply_text(txt, reply_markup=reply_markup)
     return SELECT_ADD_METHOD
 
 async def add_server_step_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع روش قدیمی (مرحله به مرحله)"""
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("🏷 **نام سرور را وارد کنید:**", reply_markup=get_cancel_markup())
+    await update.callback_query.message.reply_text("🏷 **نام سرور را وارد کنید:**", reply_markup=keyboard.get_cancel_markup())
     return GET_NAME
 
 async def add_server_linear_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع روش خطی (فرمت جدید)"""
     await update.callback_query.answer()
-    txt = (
-        "⚡️ **افزودن سریع سرورها**\n\n"
-        "لطفاً مشخصات سرورها را به صورت **5 خطی** ارسال کنید.\n"
-        "هر سرور باید دقیقاً در 5 خط زیر هم باشد:\n"
-        "1. نام سرور\n"
-        "2. آی‌پی\n"
-        "3. پورت\n"
-        "4. یوزرنیم\n"
-        "5. پسورد\n\n"
-        "⚠️ **نکته:** اگر چند سرور دارید، بلافاصله بعد از پسورد اولی، اطلاعات سرور دوم را شروع کنید.\n\n"
-        "💡 **مثال:**\n"
-        "`Server A`\n`192.168.1.1`\n`22`\n`root`\n`Pass123`\n"
-        "`Server B`\n`45.33.22.11`\n`2244`\n`admin`\n`Secr3t`\n\n"
-        "👇 اطلاعات را ارسال کنید:"
-    )
-    await update.callback_query.message.reply_text(txt, reply_markup=get_cancel_markup(), parse_mode='Markdown')
+    txt = "⚡️ **افزودن سریع سرورها**\n\nلطفاً مشخصات سرورها را به صورت **5 خطی** ارسال کنید.\nهر سرور باید دقیقاً در 5 خط زیر هم باشد:\n1. نام سرور\n2. آی‌پی\n3. پورت\n4. یوزرنیم\n5. پسورد\n\n⚠️ **نکته:** اگر چند سرور دارید، بلافاصله بعد از پسورد اولی، اطلاعات سرور دوم را شروع کنید.\n\n💡 **مثال:**\n`Server A`\n`192.168.1.1`\n`22`\n`root`\n`Pass123`\n`Server B`\n`45.33.22.11`\n`2244`\n`admin`\n`Secr3t`\n\n👇 اطلاعات را ارسال کنید:"
+    await update.callback_query.message.reply_text(txt, reply_markup=keyboard.get_cancel_markup(), parse_mode='Markdown')
     return GET_LINEAR_DATA
-
 async def process_linear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پردازش متن خطی با فرمت ۵ خطی (نسخه اصلاح شده و بدون باگ)"""
+    """پردازش متن خطی با فرمت ۵ خطی (همراه با سیستم ضد بلاک)"""
     text = update.message.text
     # حذف خطوط خالی اضافی
     lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
+
     uid = update.effective_user.id
     user = db.get_user(uid)
     limit = user['server_limit']
     current_count = len(db.get_all_user_servers(uid))
-    
+
     success = 0
     failed = 0
     report = []
-    
-    # دریافت IP ربات
-    try:
-        bot_ip = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.get_bot_public_ip)
-    except:
-        bot_ip = None
 
-    msg = await update.message.reply_text("⏳ **در حال پردازش و تست اتصال...**")
+    msg = await update.message.reply_text("⏳ **در حال پردازش، تست اتصال و ایمن‌سازی...**")
 
-    # بررسی اینکه تعداد خطوط مضربی از ۵ باشد
+    # بررسی فرمت
     if len(lines) % 5 != 0:
         await msg.edit_text(
             f"❌ **فرمت ارسال اشتباه است!**\n\n"
@@ -1694,6 +501,9 @@ async def process_linear_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     loop = asyncio.get_running_loop()
 
+    # 1. دریافت آی‌پی ربات (یکبار برای همه)
+    bot_public_ip = await loop.run_in_executor(None, ServerMonitor.get_bot_public_ip)
+
     # پردازش ۵ خط به ۵ خط
     for i in range(0, len(lines), 5):
         if uid != SUPER_ADMIN_ID and (current_count + success) >= limit:
@@ -1702,44 +512,45 @@ async def process_linear_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             continue
 
         name = lines[i]
-        ip = lines[i+1]
-        port_str = lines[i+2]
-        username = lines[i+3]
-        password = lines[i+4]
-        
+        ip = lines[i + 1]
+        port_str = lines[i + 2]
+        username = lines[i + 3]
+        password = lines[i + 4]
+
         if not port_str.isdigit():
             report.append(f"⚠️ پورت نامعتبر برای {name}: `{port_str}`")
             failed += 1
             continue
-            
+
         port = int(port_str)
-        
+
         # تست اتصال
         res = await loop.run_in_executor(
             None, ServerMonitor.check_full_stats, ip, port, username, password
         )
-        
+
         if res['status'] == 'Online':
             try:
+                # ذخیره در دیتابیس
                 data = {
-                    'name': name, 'ip': ip, 'port': port, 
+                    'name': name, 'ip': ip, 'port': port,
                     'username': username, 'password': sec.encrypt(password),
                     'expiry_date': None
                 }
-                
                 db.add_server(uid, 0, data)
-                
-                # ✅ اصلاح بخش وایت‌لیست (رفع ارور Future pending)
-                if bot_ip:
-                    async def do_whitelist_bg():
-                        await loop.run_in_executor(None, ServerMonitor.whitelist_bot_ip, ip, port, username, password, bot_ip)
-                    # تسک را بدون await اجرا می‌کنیم تا سرعت کم نشود و ارور ندهد
-                    asyncio.create_task(do_whitelist_bg())
-                
-                report.append(f"✅ **{name}**: افزوده شد.")
+
+                # ✅ اجرای سیستم ضد بلاک (Anti-Block)
+                if bot_public_ip:
+                    # تعریف تابع برای اجرا در ترد جداگانه
+                    def run_whitelist():
+                        ServerMonitor.whitelist_bot_ip(ip, port, username, password, bot_public_ip)
+                    
+                    # اجرا در پس‌زمینه (Fire & Forget) تا سرعت افزودن کم نشود
+                    asyncio.create_task(loop.run_in_executor(None, run_whitelist))
+
+                report.append(f"✅ **{name}**: افزوده و ایمن‌سازی شد.")
                 success += 1
             except Exception as e:
-                # اگر واقعاً دیتابیس ارور داد (مثلا نام تکراری)
                 report.append(f"❌ خطا در ذخیره {name}: {e}")
                 failed += 1
         else:
@@ -1747,38 +558,48 @@ async def process_linear_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             failed += 1
 
     final_txt = (
-        f"📊 **نتیجه عملیات:**\n"
-        f"✅ موفق: `{success}` | ❌ ناموفق: `{failed}`\n"
-        f"➖➖➖➖➖➖➖➖\n" + 
-        "\n".join(report)
+            f"📊 **نتیجه عملیات:**\n"
+            f"✅ موفق: `{success}` | ❌ ناموفق: `{failed}`\n"
+            f"➖➖➖➖➖➖➖➖\n" +
+            "\n".join(report)
     )
-    
+
     await msg.edit_text(final_txt, parse_mode='Markdown')
     await asyncio.sleep(3)
     await start(update, context)
     return ConversationHandler.END
+
 async def get_srv_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['srv'] = {'name': update.message.text}
-    await update.message.reply_text("🌐 **آدرس IP سرور را وارد کنید:**", reply_markup=get_cancel_markup(), parse_mode='Markdown')
+    await update.message.reply_text("🌐 **آدرس IP سرور را وارد کنید:**", reply_markup=keyboard.get_cancel_markup(),
+                                    parse_mode='Markdown')
     return GET_IP
+
 
 async def get_srv_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['srv']['ip'] = update.message.text
-    await update.message.reply_text("🔌 **پورت SSH را وارد کنید:**", reply_markup=get_cancel_markup(), parse_mode='Markdown')
+    await update.message.reply_text("🔌 **پورت SSH را وارد کنید:**", reply_markup=keyboard.get_cancel_markup(),
+                                    parse_mode='Markdown')
     return GET_PORT
 
+
 async def get_srv_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: context.user_data['srv']['port'] = int(update.message.text)
-    except: 
+    try:
+        context.user_data['srv']['port'] = int(update.message.text)
+    except:
         await update.message.reply_text("❌ فقط عدد وارد کنید.")
         return GET_PORT
-    await update.message.reply_text("👤 **نام کاربری (Username) را وارد کنید:**", reply_markup=get_cancel_markup(), parse_mode='Markdown')
+    await update.message.reply_text("👤 **نام کاربری (Username) را وارد کنید:**", reply_markup=keyboard.get_cancel_markup(),
+                                    parse_mode='Markdown')
     return GET_USER
+
 
 async def get_srv_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['srv']['username'] = update.message.text
-    await update.message.reply_text("🔑 **رمز عبور (Password) را وارد کنید:**", reply_markup=get_cancel_markup(), parse_mode='Markdown')
+    await update.message.reply_text("🔑 **رمز عبور (Password) را وارد کنید:**", reply_markup=keyboard.get_cancel_markup(),
+                                    parse_mode='Markdown')
     return GET_PASS
+
 
 async def get_srv_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['srv']['password'] = sec.encrypt(update.message.text)
@@ -1786,9 +607,10 @@ async def get_srv_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📅 **مهلت انقضای سرور چند روز دیگر است؟**\n\n"
         "🔢 عدد وارد کنید (مثلاً `30` برای یک ماه)\n"
         "یا عدد `0` را وارد کنید اگر نامحدود است.",
-        reply_markup=get_cancel_markup(), parse_mode='Markdown'
+        reply_markup=keyboard.get_cancel_markup(), parse_mode='Markdown'
     )
     return GET_EXPIRY
+
 
 async def get_srv_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1804,67 +626,89 @@ async def get_srv_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید (مثلا 30).")
         return GET_EXPIRY
 
-    await update.message.reply_text(f"{msg}\n\n📂 **حالا سرور در کدام پوشه ذخیره شود؟**", reply_markup=InlineKeyboardMarkup(await get_group_keyboard(update.effective_user.id)), parse_mode='Markdown')
+    # استفاده از ماژول کیبورد (برای select_group_kb که لیست برمی‌گرداند)
+    group_kb_list = await get_group_keyboard(update.effective_user.id)
+    
+    await update.message.reply_text(f"{msg}\n\n📂 **حالا سرور در کدام پوشه ذخیره شود؟**",
+                                    reply_markup=InlineKeyboardMarkup(group_kb_list),
+                                    parse_mode='Markdown')
     return SELECT_GROUP
+
 
 async def get_group_keyboard(uid):
     groups = db.get_user_groups(uid)
-    kb = [[InlineKeyboardButton(f"📁 {g['name']}", callback_data=str(g['id']))] for g in groups]
-    kb.append([InlineKeyboardButton("فایل اصلی (بدون گروه)", callback_data="0")])
-    kb.append([InlineKeyboardButton("🔙 انصراف", callback_data="cancel_flow")])
-    return kb
+    return keyboard.select_group_kb(groups)
+
 
 async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ذخیره نهایی سرور و اجرای وایت‌لیست"""
     if update.callback_query.data == 'cancel_flow': return await cancel_handler_func(update, context)
-    await safe_edit_message(update, "⚡️ **در حال تست اتصال به سرور... (لطفاً صبر کنید)**")
+    
+    await safe_edit_message(update, "⚡️ **در حال تست اتصال و ایمن‌سازی سرور...**")
+    
     data = context.user_data['srv']
-    res = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.check_full_stats, data['ip'], data['port'], data['username'], sec.decrypt(data['password']))
+    loop = asyncio.get_running_loop()
+    
+    # تست اتصال
+    res = await loop.run_in_executor(None, ServerMonitor.check_full_stats, data['ip'], data['port'], data['username'], sec.decrypt(data['password']))
+    
     if res['status'] == 'Online':
         try:
+            # ذخیره در دیتابیس
             db.add_server(update.effective_user.id, int(update.callback_query.data), data)
+            
+            # ✅ اجرای سیستم ضد بلاک (Anti-Block)
             try:
-                bot_ip = ServerMonitor.get_bot_public_ip()
+                bot_ip = await loop.run_in_executor(None, ServerMonitor.get_bot_public_ip)
                 if bot_ip:
-                    asyncio.create_task(asyncio.get_running_loop().run_in_executor(
-                        None, 
-                        ServerMonitor.whitelist_bot_ip, 
-                        data['ip'], data['port'], data['username'], sec.decrypt(data['password']), bot_ip
-                    ))
+                    # اجرا در پس‌زمینه
+                    def run_whitelist():
+                        ServerMonitor.whitelist_bot_ip(data['ip'], data['port'], data['username'], sec.decrypt(data['password']), bot_ip)
+                    
+                    asyncio.create_task(loop.run_in_executor(None, run_whitelist))
             except Exception as e:
                 logger.error(f"Whitelist Error on Add: {e}")
-            await update.callback_query.message.reply_text("✅ **اتصال موفق! سرور ذخیره شد.**", parse_mode='Markdown')
-        except Exception as e: await update.callback_query.message.reply_text(f"❌ خطا: {e}")
+
+            await update.callback_query.message.reply_text("✅ **اتصال موفق! سرور ذخیره و وایت‌لیست شد.**", parse_mode='Markdown')
+        except Exception as e:
+            await update.callback_query.message.reply_text(f"❌ خطا در ذخیره: {e}")
     else:
         await update.callback_query.message.reply_text(f"❌ **عدم اتصال به سرور!**\n\n⚠️ خطا: `{res['error']}`", parse_mode='Markdown')
+        
     await start(update, context)
     return ConversationHandler.END
 
 async def list_groups_for_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer()
-    except: pass
+    try:
+        await update.callback_query.answer()
+    except:
+        pass
     groups = db.get_user_groups(update.effective_user.id)
-    kb = [[InlineKeyboardButton("🔗 همه سرورها (یکجا)", callback_data='list_all')]] + [[InlineKeyboardButton(f"📁 {g['name']}", callback_data=f'listsrv_{g["id"]}')] for g in groups]
-    kb.append([InlineKeyboardButton("📄 سرورهای بدون گروه", callback_data='listsrv_0')])
-    kb.append([InlineKeyboardButton("🔙 منوی اصلی", callback_data='main_menu')])
-    await safe_edit_message(update, "🗂 **پوشه مورد نظر را انتخاب کنید:**", reply_markup=InlineKeyboardMarkup(kb))
+    
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.group_selection_kb(groups)
+    
+    await safe_edit_message(update, "🗂 **پوشه مورد نظر را انتخاب کنید:**", reply_markup=reply_markup)
+
 
 async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer()
-    except: pass
+    try:
+        await update.callback_query.answer()
+    except:
+        pass
     uid, data = update.effective_user.id, update.callback_query.data
-    servers = db.get_all_user_servers(uid) if data == 'list_all' else db.get_servers_by_group(uid, int(data.split('_')[1]))
-    if not servers: 
-        try: await update.callback_query.answer("⚠️ این پوشه خالی است!", show_alert=True)
-        except: pass
+    servers = db.get_all_user_servers(uid) if data == 'list_all' else db.get_servers_by_group(uid, int(
+        data.split('_')[1]))
+    if not servers:
+        try:
+            await update.callback_query.answer("⚠️ این پوشه خالی است!", show_alert=True)
+        except:
+            pass
         return
-    kb = []
-    for s in servers:
-        status_icon = "🟢" if s['last_status'] == 'Online' else "🔴"
-        kb.append([InlineKeyboardButton(f"{status_icon} {s['name']}  |  {s['ip']}", callback_data=f'detail_{s["id"]}')])
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='list_groups_for_servers')])
-    await safe_edit_message(update, "🖥 **لیست سرورها:**", reply_markup=InlineKeyboardMarkup(kb))
-
-
+    
+    reply_markup = keyboard.server_list_kb(servers)
+    
+    await safe_edit_message(update, "🖥 **لیست سرورها:**", reply_markup=reply_markup)
 # ==============================================================================
 # 📊 MONITORING & SERVER ACTIONS
 # ==============================================================================
@@ -1872,55 +716,84 @@ async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status_dashboard(update, context)
 
 async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """داشبورد اصلی با رابط کاربری گرافیکی و تفکیک شده"""
     if update.callback_query:
         try: await update.callback_query.answer()
         except: pass
-        await safe_edit_message(update, "🔄 **در حال دریافت اطلاعات سرورها... (لطفاً صبر کنید)**")
-    else:
-        await update.message.reply_text("🔄 **در حال دریافت اطلاعات سرورها...**")
-
-    user_id = update.effective_user.id
-    servers = db.get_all_user_servers(user_id)
-    if not servers:
-        msg = "📂 **سروری یافت نشد!**\nابتدا یک سرور اضافه کنید."
-        if update.callback_query: 
-            await safe_edit_message(update, msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]]))
-        else:
-             await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]]))
-        return
     
+    user = update.effective_user
+    j_date = get_jalali_str()
+    
+    txt = (
+        f"📊 **داشبورد مدیریتی سونار**\n"
+        f"👤 کاربر: {user.full_name}\n"
+        f"📅 تاریخ: `{j_date}`\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"یکی از بخش‌های زیر را برای مشاهده وضعیت انتخاب کنید:"
+    )
+    
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.dashboard_main_kb()
+    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+# این تابع جدید برای نمایش وضعیت سرورهاست (جایگزین لاجیک قبلی در داشبورد)
+async def show_server_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = update.effective_user.id
+    
+    await safe_edit_message(update, "🔄 **در حال دریافت وضعیت سرورها...**")
+    
+    servers = db.get_all_user_servers(uid)
+    if not servers:
+        await safe_edit_message(update, "❌ هیچ سروری ثبت نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')]]))
+        return
+
     loop = asyncio.get_running_loop()
     tasks = []
     for s in servers:
         if s['is_active']:
-            tasks.append(loop.run_in_executor(None, ServerMonitor.check_full_stats, s['ip'], s['port'], s['username'], sec.decrypt(s['password'])))
+            # 👇 اصلاح شد: استفاده از StatsManager
+            tasks.append(loop.run_in_executor(None, StatsManager.check_full_stats, s['ip'], s['port'], s['username'], sec.decrypt(s['password'])))
         else:
-            async def fake(): return {'status': 'Disabled', 'uptime_sec': -1, 'traffic_gb': 0}
+            async def fake(): return {'status': 'Disabled'}
             tasks.append(fake())
-    
+            
     results = await asyncio.gather(*tasks)
-    txt = f"📊 **داشبورد وضعیت شبکه** 🦇\n📆 `{get_jalali_str()}`\n➖➖➖➖➖➖➖➖➖➖\n\n"
-    active_count = sum(1 for r in results if isinstance(r, dict) and r['status'] == 'Online')
-    txt += f"🟢 **سرورهای آنلاین:** `{active_count}`\n🔴 **آفلاین/خاموش:** `{len(servers) - active_count}`\n\n"
+    
+    txt = f"🖥 **وضعیت سرورهای شما**\n➖➖➖➖➖➖➖➖➖➖\n\n"
+    active_count = 0
     
     for i, res in enumerate(results):
         final_res = res if isinstance(res, dict) else await res
-        srv_name = servers[i]['name']
-        if final_res['status'] == 'Disabled': txt += f"⚪️ **{srv_name}** ⇽ 💤 (خاموش)\n"
-        elif final_res['status'] == 'Offline': txt += f"🔴 **{srv_name}** ⇽ ⛔️ **OFFLINE**\n"
+        srv = servers[i]
+        
+        if final_res.get('status') == 'Online':
+            active_count += 1
+            # 👇 اصلاح شد: استفاده از StatsManager
+            cpu_bar = StatsManager.make_bar(final_res['cpu'], 5)
+            ram_bar = StatsManager.make_bar(final_res['ram'], 5)
+            txt += (
+                f"🟢 **{srv['name']}**\n"
+                f"   🧠 CPU: `{cpu_bar}` {final_res['cpu']}%\n"
+                f"   💾 RAM: `{ram_bar}` {final_res['ram']}%\n"
+                f"   📡 Traf: `{final_res['traffic_gb']} GB`\n"
+                f"────────────────\n"
+            )
         else:
-            txt += (f"🟢 **{srv_name}**\n"
-                f"   ├ ⏱ `{final_res['uptime_str']}`\n"
-                f"   ├ 📡 Traf: `{final_res['traffic_gb']} GB`\n"
-                f"   └ 💻 CPU: `{final_res['cpu']}%`  RAM: `{final_res['ram']}%`\n\n")
+             txt += f"🔴 **{srv['name']}** ⇽ ⛔️ OFFLINE\n────────────────\n"
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.server_stats_kb()
     
-    kb = [[InlineKeyboardButton("⚡️ مدیریت سرورها", callback_data='manage_servers_list')], [InlineKeyboardButton("🔄 بروزرسانی", callback_data='status_dashboard')], [InlineKeyboardButton("🔙 منوی اصلی", callback_data='main_menu')]]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
 
 async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_sid=None):
     if update.callback_query:
-        try: await update.callback_query.answer()
-        except: pass
+        try:
+            await update.callback_query.answer()
+        except:
+            pass
 
     if custom_sid:
         sid = custom_sid
@@ -1931,37 +804,31 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
 
     srv = db.get_server_by_id(sid)
     if not srv: return
-    
+
     await safe_edit_message(update, f"⚡️ **در حال پردازش اطلاعات سرور {srv['name']}...**")
-    
+
     user_id = update.effective_user.id
     user = db.get_user(user_id)
     is_premium = True if user['plan_type'] == 1 or user_id == SUPER_ADMIN_ID else False
-    
-    # دکمه پاکسازی دیسک جایگزین ترمینال شد
-    btn_clean = InlineKeyboardButton("🧹 پاکسازی دیسک", callback_data=f'act_cleandisk_{sid}')
-    
-    if is_premium:
-        btn_script = InlineKeyboardButton("🛠 اسکریپت", callback_data=f'act_installscript_{sid}')
-    else:
-        btn_script = InlineKeyboardButton("🔒 اسکریپت", callback_data=f'act_installscript_{sid}')
 
+    # 👇 اصلاح شد: استفاده از StatsManager
     res = await asyncio.get_running_loop().run_in_executor(
-        None, ServerMonitor.check_full_stats, srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password'])
+        None, StatsManager.check_full_stats, srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password'])
     )
-    
+
     expiry_display = "♾ **نامحدود (همیشگی)**"
     status_expiry = "✅"
-    
+
     if srv['expiry_date']:
         try:
             exp_date_obj = datetime.strptime(srv['expiry_date'], '%Y-%m-%d')
             today = datetime.now().date()
             days_left = (exp_date_obj.date() - today).days
             j_date = jdatetime.date.fromgregorian(date=exp_date_obj)
-            persian_months = {1: 'فروردین', 2: 'اردیبهشت', 3: 'خرداد', 4: 'تیر', 5: 'مرداد', 6: 'شهریور', 7: 'مهر', 8: 'آبان', 9: 'آذر', 10: 'دی', 11: 'بهمن', 12: 'اسفند'}
+            persian_months = {1: 'فروردین', 2: 'اردیبهشت', 3: 'خرداد', 4: 'تیر', 5: 'مرداد', 6: 'شهریور', 7: 'مهر',
+                              8: 'آبان', 9: 'آذر', 10: 'دی', 11: 'بهمن', 12: 'اسفند'}
             expiry_display = f"{j_date.day} {persian_months[j_date.month]} {j_date.year}"
-            
+
             if days_left < 0:
                 expiry_display += f"\n   🚩 **( {abs(days_left)} روز گذشته - منقضی شده 🔴 )**"
                 status_expiry = "🔴"
@@ -1988,38 +855,8 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
             f"   ╰ (معادل **{equiv_days}** روز فعالیت 🔥)"
         )
 
-    kb = [
-        [
-            InlineKeyboardButton("📊 نمودار", callback_data=f'act_chart_{sid}'),
-            InlineKeyboardButton("🔄 تازه‌سازی", callback_data=f'detail_{sid}')
-        ],
-        [
-            InlineKeyboardButton("🌍 بررسی وضعیت جهانی", callback_data=f'act_checkhost_{sid}_{srv["ip"]}'),
-            InlineKeyboardButton("🏢 دیتاسنتر", callback_data=f'act_datacenter_{sid}')
-        ],
-        [
-            InlineKeyboardButton("📝 گزارش جامع جهانی", callback_data=f'act_fullreport_{sid}')
-        ],
-        [
-            InlineKeyboardButton("🚀 تست سرعت", callback_data=f'act_speedtest_{sid}'),
-            InlineKeyboardButton("🧹 پاکسازی RAM", callback_data=f'act_clearcache_{sid}')
-        ],
-        [
-            InlineKeyboardButton("⚙️ DNS", callback_data=f'act_dns_{sid}'),
-            InlineKeyboardButton("📥 نصب Speedtest", callback_data=f'act_installspeed_{sid}')
-        ],
-        [
-            InlineKeyboardButton("📦 بروزرسانی Repo", callback_data=f'act_repoupdate_{sid}'),
-            InlineKeyboardButton("💎 ارتقاء کامل", callback_data=f'act_fullupdate_{sid}')
-        ],
-        [
-            InlineKeyboardButton("📅 ویرایش انقضا", callback_data=f'act_editexpiry_{sid}'),
-            InlineKeyboardButton("⚠️ راه‌اندازی مجدد", callback_data=f'act_reboot_{sid}')
-        ],
-        [btn_clean, btn_script],
-        [InlineKeyboardButton("❌ حذف سرور", callback_data=f'act_del_{sid}')],
-        [InlineKeyboardButton("🔙 بازگشت به لیست", callback_data='list_groups_for_servers')]
-    ]
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.server_detail_kb(sid, srv['ip'], is_premium)
 
     if res['status'] == 'Online':
         db.update_status(sid, "Online")
@@ -2039,11 +876,11 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📊 **منابع:**\n\n"
             f"{cpu_emoji} **CPU:** `{res['cpu']}%`\n"
-            f"`{ServerMonitor.make_bar(res['cpu'], length=15)}`\n\n"
+            f"`{StatsManager.make_bar(res['cpu'], length=15)}`\n\n"
             f"{ram_emoji} **RAM:** `{res['ram']}%`\n"
-            f"`{ServerMonitor.make_bar(res['ram'], length=15)}`\n\n"
+            f"`{StatsManager.make_bar(res['ram'], length=15)}`\n\n"
             f"{disk_emoji} **Disk:** `{res['disk']}%`\n"
-            f"`{ServerMonitor.make_bar(res['disk'], length=15)}`"
+            f"`{StatsManager.make_bar(res['disk'], length=15)}`"
         )
     else:
         db.update_status(sid, "Offline")
@@ -2058,49 +895,58 @@ async def server_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, cust
             f"📅 **انقضا:**\n`{expiry_display}`\n\n"
             f"❌ **خطا:**\n`{res['error']}`"
         )
-        
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
 
 async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     parts = data.split('_')
     act, sid = parts[1], parts[2]
-    
+
     srv = db.get_server_by_id(sid)
     if not srv:
-        try: await update.callback_query.answer("❌ سرور یافت نشد!", show_alert=True)
-        except: pass
+        try:
+            await update.callback_query.answer("❌ سرور یافت نشد!", show_alert=True)
+        except:
+            pass
         return
 
     uid = update.effective_user.id
     user = db.get_user(uid)
     is_premium = True if user['plan_type'] == 1 or uid == SUPER_ADMIN_ID else False
-    
-    LOCKED_FEATURES = ['installscript'] 
+
+    LOCKED_FEATURES = ['installscript']
 
     if act in LOCKED_FEATURES and not is_premium:
-        try: await update.callback_query.answer("🔒 این قابلیت مخصوص کاربران پریمیوم است!", show_alert=True)
-        except: pass
+        try:
+            await update.callback_query.answer("🔒 این قابلیت مخصوص کاربران پریمیوم است!", show_alert=True)
+        except:
+            pass
         return
 
     if srv['password']:
         real_pass = sec.decrypt(srv['password'])
     else:
         real_pass = ""
-        
+
     loop = asyncio.get_running_loop()
-    
+
     if act == 'del':
         db.delete_server(sid, update.effective_user.id)
-        try: await update.callback_query.answer("✅ سرور با موفقیت حذف شد.")
-        except: pass
+        try:
+            await update.callback_query.answer("✅ سرور با موفقیت حذف شد.")
+        except:
+            pass
         await list_groups_for_servers(update, context)
 
     elif act == 'reboot':
-        try: await update.callback_query.answer("⚠️ دستور ریبوت ارسال شد.")
-        except: pass
+        try:
+            await update.callback_query.answer("⚠️ دستور ریبوت ارسال شد.")
+        except:
+            pass
+        # عملیات اجرایی همچنان در ServerMonitor (Core) باقی می‌ماند
         asyncio.create_task(run_background_ssh_task(
-            context, update.effective_chat.id, 
+            context, update.effective_chat.id,
             ServerMonitor.run_remote_command, srv['ip'], srv['port'], srv['username'], real_pass, "reboot"
         ))
 
@@ -2113,11 +959,12 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "1️⃣ استعلام دیتاسنتر...\n"
             "2️⃣ پینگ جهانی (۱۰ ثانیه زمان می‌برد)..."
         )
-        task_dc = loop.run_in_executor(None, ServerMonitor.get_datacenter_info, srv['ip'])
-        task_ch = loop.run_in_executor(None, ServerMonitor.check_host_api, srv['ip'])
-        
+        # 👇 اصلاح شد: استفاده از StatsManager برای اطلاعات آماری
+        task_dc = loop.run_in_executor(None, StatsManager.get_datacenter_info, srv['ip'])
+        task_ch = loop.run_in_executor(None, StatsManager.check_host_api, srv['ip'])
+
         (dc_ok, dc_data), (ch_ok, ch_data) = await asyncio.gather(task_dc, task_ch)
-        
+
         if dc_ok:
             infra_txt = (
                 f"🏢 **زیرساخت (Infrastructure):**\n"
@@ -2130,10 +977,11 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             infra_txt = f"❌ خطا در دریافت اطلاعات دیتاسنتر: {dc_data}\n"
 
         if ch_ok:
-            ping_txt = ServerMonitor.format_full_global_results(ch_data)
+            # 👇 اصلاح شد: استفاده از StatsManager
+            ping_txt = StatsManager.format_full_global_results(ch_data)
         else:
             ping_txt = f"❌ خطا در Check-Host API: {ch_data}"
-            
+
         final_report = (
             f"📊 **گزارش جامع سرور: {srv['name']}**\n"
             f"📅 {get_jalali_str()}\n\n"
@@ -2151,7 +999,8 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not stats:
             await update.callback_query.message.reply_text("❌ داده‌ای برای رسم نمودار موجود نیست.")
             return
-        photo = await loop.run_in_executor(None, generate_plot, srv['name'], stats)
+        # 👇 اصلاح شد: استفاده از StatsManager
+        photo = await loop.run_in_executor(None, StatsManager.generate_plot, srv['name'], stats)
         if photo:
             await update.callback_query.message.reply_photo(photo=photo, caption=f"📊 مصرف منابع: **{srv['name']}**")
         else:
@@ -2159,7 +1008,8 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif act == 'datacenter':
         await update.callback_query.message.reply_text("🔍 **در حال استعلام...**")
-        ok, data = await loop.run_in_executor(None, ServerMonitor.get_datacenter_info, srv['ip'])
+        # 👇 اصلاح شد: استفاده از StatsManager
+        ok, data = await loop.run_in_executor(None, StatsManager.get_datacenter_info, srv['ip'])
         if ok:
             txt = (
                 f"🏢 **مشخصات دیتاسنتر:**\n"
@@ -2175,44 +1025,51 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif act == 'checkhost':
         await update.callback_query.message.reply_text("🌍 **در حال دریافت گزارش Check-Host...**")
-        ok, data = await loop.run_in_executor(None, ServerMonitor.check_host_api, parts[3])
-        report = ServerMonitor.format_check_host_results(data) if ok else f"❌ خطا: {data}"
+        # 👇 اصلاح شد: استفاده از StatsManager
+        ok, data = await loop.run_in_executor(None, StatsManager.check_host_api, parts[3])
+        report = StatsManager.format_check_host_results(data) if ok else f"❌ خطا: {data}"
         await update.callback_query.message.reply_text(report, parse_mode='Markdown')
 
     elif act == 'speedtest':
-        await update.callback_query.message.reply_text("🚀 **تست سرعت آغاز شد...**\n(نتیجه پس از پایان ارسال می‌شود، می‌توانید به کارهای دیگر برسید)")
+        await update.callback_query.message.reply_text(
+            "🚀 **تست سرعت آغاز شد...**\n(نتیجه پس از پایان ارسال می‌شود، می‌توانید به کارهای دیگر برسید)")
+        # عملیات اجرایی همچنان در ServerMonitor (Core) باقی می‌ماند
         asyncio.create_task(run_background_ssh_task(
-            context, update.effective_chat.id, 
+            context, update.effective_chat.id,
             ServerMonitor.run_speedtest, srv['ip'], srv['port'], srv['username'], real_pass
         ))
-        
+
     elif act == 'installspeed':
         await update.callback_query.message.reply_text("📥 **نصب ابزار Speedtest در پس‌زمینه آغاز شد...**")
         asyncio.create_task(run_background_ssh_task(
-            context, update.effective_chat.id, 
+            context, update.effective_chat.id,
             ServerMonitor.install_speedtest, srv['ip'], srv['port'], srv['username'], real_pass
         ))
-        
+
     elif act == 'repoupdate':
-        await update.callback_query.message.reply_text("📦 **آپدیت مخازن در حال انجام است...**\n(لطفاً صبور باشید، نتیجه ارسال می‌شود)")
+        await update.callback_query.message.reply_text(
+            "📦 **آپدیت مخازن در حال انجام است...**\n(لطفاً صبور باشید، نتیجه ارسال می‌شود)")
         asyncio.create_task(run_background_ssh_task(
-            context, update.effective_chat.id, 
+            context, update.effective_chat.id,
             ServerMonitor.repo_update, srv['ip'], srv['port'], srv['username'], real_pass
         ))
-        
+
     elif act == 'fullupdate':
-        await update.callback_query.message.reply_text("💎 **آپدیت کامل سیستم آغاز شد!**\n⚠️ این عملیات ممکن است ۱۰ تا ۲۰ دقیقه زمان ببرد.\nنتیجه پس از پایان ارسال خواهد شد.")
+        await update.callback_query.message.reply_text(
+            "💎 **آپدیت کامل سیستم آغاز شد!**\n⚠️ این عملیات ممکن است ۱۰ تا ۲۰ دقیقه زمان ببرد.\nنتیجه پس از پایان ارسال خواهد شد.")
         asyncio.create_task(run_background_ssh_task(
-            context, update.effective_chat.id, 
+            context, update.effective_chat.id,
             ServerMonitor.full_system_update, srv['ip'], srv['port'], srv['username'], real_pass
         ))
 
     elif act == 'clearcache':
-        try: await update.callback_query.answer("🧹 کش رم پاکسازی شد.")
-        except: pass
+        try:
+            await update.callback_query.answer("🧹 کش رم پاکسازی شد.")
+        except:
+            pass
         await loop.run_in_executor(None, ServerMonitor.clear_cache, srv['ip'], srv['port'], srv['username'], real_pass)
         await server_detail(update, context)
-    
+
     elif act == 'cleandisk':
         await update.callback_query.message.reply_text(
             "🧹 **پاکسازی دیسک آغاز شد...**\n"
@@ -2223,397 +1080,70 @@ async def server_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "- فایل‌های موقت (Tmp)\n\n"
             "⏳ لطفاً صبر کنید..."
         )
-        ok, result = await loop.run_in_executor(None, ServerMonitor.clean_disk_space, srv['ip'], srv['port'], srv['username'], real_pass)
+        ok, result = await loop.run_in_executor(None, ServerMonitor.clean_disk_space, srv['ip'], srv['port'],
+                                                srv['username'], real_pass)
         if ok:
-            await update.callback_query.message.reply_text(f"✅ **پاکسازی با موفقیت انجام شد.**\n💾 فضای آزاد شده: `{result:.2f} MB`", parse_mode='Markdown')
+            await update.callback_query.message.reply_text(
+                f"✅ **پاکسازی با موفقیت انجام شد.**\n💾 فضای آزاد شده: `{result:.2f} MB`", parse_mode='Markdown')
         else:
             await update.callback_query.message.reply_text(f"❌ خطا در پاکسازی:\n{result}")
         await server_detail(update, context)
-        
+
     elif act == 'dns':
-         kb = [
-             [InlineKeyboardButton("Cloudflare (1.1.1.1)", callback_data=f'setdns_cloudflare_{sid}'), 
-              InlineKeyboardButton("Google (8.8.8.8)", callback_data=f'setdns_google_{sid}')],
-             [InlineKeyboardButton("Shecan (Iran)", callback_data=f'setdns_shecan_{sid}'), 
-              InlineKeyboardButton("🔙 بازگشت", callback_data=f'detail_{sid}')]
-         ]
-         await safe_edit_message(update, "⚙️ **تنظیم DNS سرور:**\nلطفاً پرووایدر مورد نظر را انتخاب کنید.", reply_markup=InlineKeyboardMarkup(kb))
-    
+        # استفاده از ماژول کیبورد
+        reply_markup = keyboard.dns_selection_kb(sid)
+        
+        await safe_edit_message(update,
+                                "⚙️ **تنظیم DNS سرور:**\nلطفاً پرووایدر مورد نظر را انتخاب کنید.\n(پس از انتخاب، اتصال اینترنت سرور با DNS جدید برقرار می‌شود)",
+                                reply_markup=reply_markup)
+
     elif act == 'locked_terminal':
-       try: await update.callback_query.answer("🔒 ترمینال مخصوص کاربران پریمیوم است.\nبرای دسترسی ارتقا دهید.", show_alert=True)
-       except: pass
+        try:
+            await update.callback_query.answer("🔒 ترمینال مخصوص کاربران پریمیوم است.\nبرای دسترسی ارتقا دهید.",
+                                               show_alert=True)
+        except:
+            pass
 
     elif act == 'installscript':
-        try: await update.callback_query.answer("🚧 این بخش در حال توسعه است!", show_alert=True)
-        except: pass
-
-async def send_global_full_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    
-    channels = db.get_user_channels(uid)
-    if not channels:
-        try: await query.answer("❌ ابتدا کانالی برای ارسال گزارش ثبت کنید!", show_alert=True)
-        except BadRequest: pass 
-        return
-
-    user = db.get_user(uid)
-    is_premium = True if user['plan_type'] == 1 or uid == SUPER_ADMIN_ID else False
-    limit = 20 if is_premium else 3
-    
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    user_usage = DAILY_REPORT_USAGE.get(uid, {'date': today_str, 'count': 0})
-    
-    if user_usage['date'] != today_str:
-        user_usage = {'date': today_str, 'count': 0}
-    
-    if user_usage['count'] >= limit:
-        try: await query.answer(f"⛔️ سقف مجاز روزانه شما ({limit} بار) پر شده است.\nبرای افزایش به پریمیوم ارتقا دهید.", show_alert=True)
-        except BadRequest: pass
-        return
-
-    try:
-        await query.answer("✅ در حال پردازش و ارسال به کانال...", show_alert=True)
-    except BadRequest: pass
-
-    loading_msg = await query.message.reply_text("⏳ **در حال آنالیز تک‌تک سرورها و ارسال به کانال...**\nلطفاً صبر کنید.")
-    
-    servers = db.get_all_user_servers(uid)
-    active_servers = [s for s in servers if s['is_active']]
-    
-    if not active_servers:
-        await loading_msg.edit_text("❌ هیچ سرور فعالی ندارید.")
-        return
-
-    user_usage['count'] += 1
-    DAILY_REPORT_USAGE[uid] = user_usage
-    
-    loop = asyncio.get_running_loop()
-    sent_count = 0
-
-    header = f"📣 **گزارش وضعیت فوری شبکه**\n📅 زمان: `{get_jalali_str()}`\n👤 کاربر: {user['full_name']}\n➖➖➖➖➖➖➖➖➖➖"
-    for ch in channels:
-        try: await context.bot.send_message(ch['chat_id'], header, parse_mode='Markdown')
-        except: pass
-
-    for srv in active_servers:
         try:
-            task_ssh = loop.run_in_executor(None, ServerMonitor.check_full_stats, srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password']))
-            task_dc = loop.run_in_executor(None, ServerMonitor.get_datacenter_info, srv['ip'])
-            
-            ssh_res, (dc_ok, dc_data) = await asyncio.gather(task_ssh, task_dc)
-            
-            if ssh_res['status'] == 'Online':
-                cpu_bar = ServerMonitor.make_bar(ssh_res['cpu'], length=10)
-                ram_bar = ServerMonitor.make_bar(ssh_res['ram'], length=10)
-                
-                country = "Unknown"
-                if dc_ok:
-                    country = f"{dc_data['country_name']} ({dc_data['country_code2']})"
-
-                msg = (
-                    f"🖥 **{srv['name']}** 🟢 آنلاین\n"
-                    f"➖➖➖➖➖➖➖➖➖➖\n"
-                    f"🏢 **دیتاسنتر:** `{country}`\n"
-                    f"🌐 **آی‌پی:** `{srv['ip']}`\n\n"
-                    f"🧠 **CPU:** `{cpu_bar}` {ssh_res['cpu']}%\n"
-                    f"💾 **RAM:** `{ram_bar}` {ssh_res['ram']}%\n"
-                    f"💿 **DISK:** `{ssh_res['disk']}%`\n"
-                    f"⏱ **آپتایم:** `{ssh_res['uptime_str']}`\n"
-                    f"📡 **ترافیک:** `{ssh_res['traffic_gb']} GB`"
-                )
-            else:
-                msg = (
-                    f"🖥 **{srv['name']}** 🔴 **آفلاین**\n"
-                    f"➖➖➖➖➖➖➖➖➖➖\n"
-                    f"⚠️ عدم دسترسی به سرور!\n"
-                    f"❌ خطا: `{ssh_res['error']}`"
-                )
-
-            for ch in channels:
-                try:
-                    await context.bot.send_message(ch['chat_id'], msg, parse_mode='Markdown')
-                except Exception as e:
-                    logger.error(f"Send Error: {e}")
-            
-            sent_count += 1
-            await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"Report Error {srv['name']}: {e}")
-
-    await loading_msg.edit_text(f"✅ **گزارش کامل {sent_count} سرور به کانال‌ها ارسال شد.**\n🔢 مصرف امروز شما: {user_usage['count']} / {limit}")
-
-
-async def set_dns_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid = update.callback_query.data.split('_')[2]
-    srv = db.get_server_by_id(sid)
-    await update.callback_query.message.reply_text("⚙️ **Applying DNS...**")
-    ok, out = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.set_dns, srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password']), update.callback_query.data.split('_')[1])
-    await update.callback_query.message.reply_text("✅ Done" if ok else f"❌ {out}")
-
-async def send_instant_channel_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            await update.callback_query.answer("🚧 این بخش در حال توسعه است!", show_alert=True)
+        except:
+            pass
+async def set_config_cron_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ذخیره تنظیمات زمان‌بندی کانفیگ"""
     query = update.callback_query
-    user_id = update.effective_user.id
+    minutes = query.data.split('_')[1]
     
-    channels = db.get_user_channels(user_id)
-    if not channels:
-        try: await query.answer("❌ ابتدا یک کانال ثبت کنید!", show_alert=True)
-        except: pass
-        return
-
-    loading_msg = await query.message.reply_text("⏳ **در حال جمع‌آوری و مرتب‌سازی اطلاعات...**")
-    servers = db.get_all_user_servers(user_id)
-    active_servers = [s for s in servers if s['is_active']]
+    db.set_setting(update.effective_user.id, 'config_report_interval', minutes)
     
-    if not active_servers:
-        await loading_msg.edit_text("❌ هیچ سرور فعالی ندارید.")
-        return
-
-    loop = asyncio.get_running_loop()
-    tasks = []
-    for srv in active_servers:
-        ssh_task = loop.run_in_executor(None, ServerMonitor.check_full_stats, srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password']))
-        ping_task = loop.run_in_executor(None, ServerMonitor.check_host_api, srv['ip'])
-        tasks.append(asyncio.gather(ssh_task, ping_task))
-
-    results = await asyncio.gather(*tasks)
-    processed_data = []
-    for i, (ssh_res, (ping_ok, ping_data)) in enumerate(results):
-        server_info = active_servers[i]
-        uptime_seconds = ssh_res.get('uptime_sec', -1) if ssh_res['status'] == 'Online' else -1
-        processed_data.append({
-            'server': server_info,
-            'ssh': ssh_res,
-            'ping': (ping_ok, ping_data),
-            'uptime_sort_key': uptime_seconds
-        })
-
-    processed_data.sort(key=lambda x: x['uptime_sort_key'], reverse=True)
-
-    current_time = get_tehran_datetime().strftime("%H:%M:%S")
-    report_lines = []
-    
-    header = (
-        f"📡 **گزارش لحظه‌ای وضعیت سرورها**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📅 زمان گزارش: `{current_time}`\n"
-        f"📊 چیدمان: بر اساس بیشترین آپتایم 🔼\n\n"
-    )
-
-    for item in processed_data:
-        srv = item['server']
-        ssh_res = item['ssh']
-        ping_ok, ping_data = item['ping']
-        
-        if ssh_res['status'] == 'Online':
-            cpu_bar = ServerMonitor.make_bar(ssh_res['cpu'], length=10)
-            ram_bar = ServerMonitor.make_bar(ssh_res['ram'], length=10)
-            iran_ping_txt = ServerMonitor.format_iran_ping_stats(ping_data) if ping_ok else "\n   ❌ خطا در Check-Host API"
-
-            srv_block = (
-                f"🖥 **{srv['name']}** 🟢 آنلاین\n"
-                f"   - ⏱ Uptime: `{ssh_res['uptime_str']}`\n"
-                f"   - 🧠 CPU: `{cpu_bar}` {ssh_res['cpu']}%\n"
-                f"   - 💾 RAM: `{ram_bar}` {ssh_res['ram']}%\n"
-                f"   - 💿 Disk: `{ssh_res['disk']}%`\n"
-                f"   - 🇮🇷 **Ping Status ✅:**"
-                f"{iran_ping_txt}\n"
-            )
-        else:
-            srv_block = (
-                f"🖥 **{srv['name']}** 🔴 **آفلاین**\n"
-                f"   ❌ خطا: {ssh_res['error']}\n"
-            )
-        report_lines.append(srv_block)
-
-    final_report = header + "\n".join(report_lines)
-    sent_count = 0
-    for ch in channels:
-        try:
-            await context.bot.send_message(chat_id=ch['chat_id'], text=final_report, parse_mode='Markdown')
-            sent_count += 1
-        except Exception as e:
-            logger.error(f"Error sending to channel {ch['chat_id']}: {e}")
-
-    await loading_msg.delete()
-    if sent_count > 0:
-        await query.message.reply_text(f"✅ گزارش مرتب‌شده به {sent_count} کانال ارسال شد.")
-    else:
-        await query.message.reply_text("❌ ارسال ناموفق بود.")
-
-async def manage_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try: await update.callback_query.answer()
+    msg = "✅ گزارش کانفیگ غیرفعال شد." if minutes == '0' else f"✅ تنظیم شد: هر {minutes} دقیقه."
+    try: await query.answer(msg, show_alert=True)
     except: pass
-    servers = db.get_all_user_servers(update.effective_user.id)
-    kb = [[InlineKeyboardButton(f"{'🟢' if s['is_active'] else '🔴'} | {s['name']}", callback_data=f'toggle_active_{s["id"]}')] for s in servers]
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')])
-    await safe_edit_message(update, "🛠 **مدیریت مانیتورینگ:**\nبا کلیک روی هر سرور، مانیتورینگ آن را روشن/خاموش کنید.", reply_markup=InlineKeyboardMarkup(kb))
-
-async def toggle_server_active_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid = int(update.callback_query.data.split('_')[2])
-    srv = db.get_server_by_id(sid)
-    db.toggle_server_active(sid, srv['is_active'])
-    try: await update.callback_query.answer(f"وضعیت {srv['name']} تغییر کرد.")
-    except: pass
-    await manage_servers_list(update, context)
-
-# --- New Missing Functions Added Here ---
-
-async def manual_ping_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🔎 **لطفاً آدرس IP یا دامنه مورد نظر را ارسال کنید:**", reply_markup=get_cancel_markup())
-    return GET_MANUAL_HOST
-
-async def perform_manual_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    host = update.message.text
-    msg = await update.message.reply_text("🌍 **در حال استعلام از Check-Host...**")
-    loop = asyncio.get_running_loop()
-    ok, data = await loop.run_in_executor(None, ServerMonitor.check_host_api, host)
     
-    report = ServerMonitor.format_check_host_results(data) if ok else f"❌ خطا: {data}"
-    await context.bot.send_message(chat_id=msg.chat_id, text=report, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 منوی اصلی", callback_data='main_menu')]]))
-    return ConversationHandler.END
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await settings_menu(update, context)
-
-# ==============================================================================
-# ⚙️ ORGANIZED SETTINGS MENUS
-# ==============================================================================
-
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """منوی اصلی تنظیمات (دسته‌بندی شده)"""
-    uid = update.effective_user.id
-    if update.callback_query: 
-        try: await update.callback_query.answer()
-        except: pass
-    
-    txt = (
-        "⚙️ **مرکز تنظیمات پیشرفته**\n\n"
-        "برای دسترسی راحت‌تر، تنظیمات به بخش‌های زیر تقسیم شده‌اند.\n"
-        "لطفاً بخش مورد نظر را انتخاب کنید:"
-    )
-    
-    kb = [
-        [
-            InlineKeyboardButton("🤖 خودکارسازی و زمان‌بندی", callback_data='menu_automation'),
-            InlineKeyboardButton("📟 مانیتورینگ و هشدارها", callback_data='menu_monitoring')
-        ],
-        [
-            InlineKeyboardButton("📢 مدیریت کانال‌های ارسال", callback_data='channels_menu')
-        ],
-        [
-            InlineKeyboardButton("📡 دریافت گزارش لحظه‌ای (تست)", callback_data='send_instant_report')
-        ],
-        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def automation_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """زیرمنوی خودکارسازی (Tasks & Cronjobs)"""
-    if update.callback_query: await update.callback_query.answer()
-    
-    uid = update.effective_user.id
-    
-    # دریافت وضعیت‌های فعلی برای نمایش در دکمه
-    cron_val = db.get_setting(uid, 'report_interval') or '0'
-    cron_status = "❌ خاموش" if cron_val == '0' else f"✅ هر {int(int(cron_val)/60)} دقیقه"
-    
-    up_val = db.get_setting(uid, 'auto_update_hours') or '0'
-    up_status = "❌ خاموش" if up_val == '0' else f"✅ هر {up_val} ساعت"
-    
-    reb_val = db.get_setting(uid, 'auto_reboot_config')
-    reb_status = "✅ فعال" if reb_val and reb_val != 'OFF' else "❌ خاموش"
-
-    txt = (
-        "🤖 **تنظیمات خودکارسازی (Automation)**\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        "در این بخش می‌توانید وظایف تکرار شونده ربات را مدیریت کنید.\n\n"
-        f"📊 **گزارش خودکار:** {cron_status}\n"
-        f"🔄 **آپدیت خودکار:** {up_status}\n"
-        f"⚠️ **ریبوت خودکار:** {reb_status}"
-    )
-    
-    kb = [
-        [InlineKeyboardButton("⏰ تنظیم زمان‌بندی گزارش (Cron)", callback_data='settings_cron')],
-        [InlineKeyboardButton("🔄 تنظیم آپدیت خودکار مخازن", callback_data='auto_up_menu')],
-        [InlineKeyboardButton("⚠️ تنظیم ریبوت خودکار سرورها", callback_data='auto_reboot_menu')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
-    ]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def monitoring_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """زیرمنوی تنظیمات نظارتی (Alerts & Thresholds)"""
-    if update.callback_query: await update.callback_query.answer()
-    
-    uid = update.effective_user.id
-    
-    # وضعیت هشدار قطعی
-    down_alert = db.get_setting(uid, 'down_alert_enabled') or '1'
-    alert_icon = "🔔 روشن" if down_alert == '1' else "🔕 خاموش"
-    toggle_val = "0" if down_alert == "1" else "1"
-    
-    # وضعیت منابع
-    cpu_limit = db.get_setting(uid, 'cpu_threshold') or '80'
-    ram_limit = db.get_setting(uid, 'ram_threshold') or '80'
-
-    txt = (
-        "📟 **تنظیمات مانیتورینگ و هشدار**\n"
-        "➖➖➖➖➖➖➖➖➖➖\n"
-        "حساسیت ربات نسبت به وضعیت سرورها را اینجا تنظیم کنید.\n\n"
-        f"🚨 **هشدار قطعی:** {alert_icon}\n"
-        f"🧠 **حد هشدار CPU:** `{cpu_limit}%`\n"
-        f"💾 **حد هشدار RAM:** `{ram_limit}%`"
-    )
-    
-    kb = [
-        [InlineKeyboardButton(f"🚨 هشدار قطعی: {alert_icon}", callback_data=f'toggle_downalert_{toggle_val}')],
-        [InlineKeyboardButton("🎚 تغییر آستانه مصرف منابع (Limits)", callback_data='settings_thresholds')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
-    ]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    chans = db.get_user_channels(uid)
-    
-    type_map = {'all': '✅ همه', 'down': '🚨 قطعی', 'report': '📊 گزارش', 'expiry': '⏳ انقضا', 'resource': '🔥 منابع'}
-    
-    kb = [[InlineKeyboardButton(f"🗑 {c['name']} ({type_map.get(c['usage_type'],'all')})", callback_data=f'delchan_{c["id"]}')] for c in chans]
-    kb.append([InlineKeyboardButton("➕ افزودن کانال", callback_data='add_channel')])
-    kb.append([InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data='settings_menu')])
-    await safe_edit_message(update, "📢 **مدیریت کانال‌ها:**", reply_markup=InlineKeyboardMarkup(kb))
-
-async def settings_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    current_val = db.get_setting(uid, 'report_interval') or '0'
-    def get_label(text, value): return f"✅ {text}" if str(value) == str(current_val) else text
-    kb = [
-        [InlineKeyboardButton(get_label("30m", 1800), callback_data='setcron_1800'), InlineKeyboardButton(get_label("60m", 3600), callback_data='setcron_3600')],
-        [InlineKeyboardButton(get_label("12h", 43200), callback_data='setcron_43200'), InlineKeyboardButton(get_label("❌ Off", 0), callback_data='setcron_0')],
-        [InlineKeyboardButton("✍️ زمان دلخواه", callback_data='setcron_custom'), InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
-    ]
-    await safe_edit_message(update, "⏰ **بازه گزارش خودکار:**", reply_markup=InlineKeyboardMarkup(kb))
+    await config_cron_menu(update, context)
 
 async def set_cron_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_setting(update.effective_user.id, 'report_interval', int(update.callback_query.data.split('_')[1]))
-    try: await update.callback_query.answer("ذخیره شد.")
-    except: pass
+    try:
+        await update.callback_query.answer("ذخیره شد.")
+    except:
+        pass
     await settings_cron_menu(update, context)
-    
+
 
 async def resource_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """منوی تنظیم آستانه مصرف منابع"""
     uid = update.effective_user.id
-    if update.callback_query: 
-        try: await update.callback_query.answer()
-        except: pass
-    
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except:
+            pass
+
     cpu_limit = db.get_setting(uid, 'cpu_threshold') or '80'
     ram_limit = db.get_setting(uid, 'ram_threshold') or '80'
     disk_limit = db.get_setting(uid, 'disk_threshold') or '90'
-    
+
     txt = (
         "🎚 **تنظیم آستانه حساسیت (Thresholds)**\n"
         "➖➖➖➖➖➖➖➖➖➖\n"
@@ -2623,22 +1153,21 @@ async def resource_settings_menu(update: Update, context: ContextTypes.DEFAULT_T
         f"💿 **حداکثر DISK مجاز:** `{disk_limit}%`"
     )
 
-    # تعریف لیست دکمه‌ها (اینجا kb تعریف می‌شود)
-    kb = [
-        [InlineKeyboardButton(f"تغییر حد CPU ({cpu_limit}%)", callback_data='set_cpu_limit')],
-        [InlineKeyboardButton(f"تغییر حد RAM ({ram_limit}%)", callback_data='set_ram_limit')],
-        [InlineKeyboardButton(f"تغییر حد Disk ({disk_limit}%)", callback_data='set_disk_limit')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_monitoring')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.resource_limits_kb(cpu_limit, ram_limit, disk_limit)
+
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
 async def toggle_down_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_setting(update.effective_user.id, 'down_alert_enabled', update.callback_query.data.split('_')[2])
-    await monitoring_settings_menu(update, context)
+    await schedules_settings_menu(update, context)
+
 
 async def ask_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🧠 **حداکثر درصد مجاز CPU (0-100):**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "🧠 **حداکثر درصد مجاز CPU (0-100):**", reply_markup=keyboard.get_cancel_markup())
     return GET_CPU_LIMIT
+
 
 async def save_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2648,13 +1177,16 @@ async def save_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ ذخیره شد: {val}%")
             await resource_settings_menu(update, context)
             return ConversationHandler.END
-    except: pass
+    except:
+        pass
     await update.message.reply_text("❌ عدد نامعتبر.")
     return GET_CPU_LIMIT
 
+
 async def ask_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "💾 **حداکثر درصد مجاز RAM (0-100):**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "💾 **حداکثر درصد مجاز RAM (0-100):**", reply_markup=keyboard.get_cancel_markup())
     return GET_RAM_LIMIT
+
 
 async def save_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2664,13 +1196,16 @@ async def save_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ ذخیره شد: {val}%")
             await resource_settings_menu(update, context)
             return ConversationHandler.END
-    except: pass
+    except:
+        pass
     await update.message.reply_text("❌ عدد نامعتبر.")
     return GET_RAM_LIMIT
 
+
 async def ask_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "💿 **حداکثر درصد مجاز Disk (0-100):**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "💿 **حداکثر درصد مجاز Disk (0-100):**", reply_markup=keyboard.get_cancel_markup())
     return GET_DISK_LIMIT
+
 
 async def save_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2680,13 +1215,16 @@ async def save_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ ذخیره شد: {val}%")
             await resource_settings_menu(update, context)
             return ConversationHandler.END
-    except: pass
+    except:
+        pass
     await update.message.reply_text("❌ عدد نامعتبر.")
     return GET_DISK_LIMIT
 
+
 async def ask_custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "✍️ **بازه زمانی (دقیقه) را وارد کنید:**", reply_markup=get_cancel_markup())
+    await safe_edit_message(update, "✍️ **بازه زمانی (دقیقه) را وارد کنید:**", reply_markup=keyboard.get_cancel_markup())
     return GET_CUSTOM_INTERVAL
+
 
 async def set_custom_interval_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2696,26 +1234,29 @@ async def set_custom_interval_action(update: Update, context: ContextTypes.DEFAU
             await update.message.reply_text(f"✅ تنظیم شد: هر {minutes} دقیقه.")
             await settings_cron_menu(update, context)
             return ConversationHandler.END
-    except: pass
+    except:
+        pass
     await update.message.reply_text("❌ عدد نامعتبر (بین 10 تا 1440).")
     return GET_CUSTOM_INTERVAL
 
+
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(
-        update, 
+        update,
         "📝 **افزودن کانال جدید**\n\n"
         "لطفاً **آیدی عددی کانال** را ارسال کنید.\n"
         "مثال: `-100123456789`\n\n"
-        "⚠️ **نکته:** ابتدا ربات را در کانال **ادمین** کنید.", 
-        reply_markup=get_cancel_markup()
+        "⚠️ **نکته:** ابتدا ربات را در کانال **ادمین** کنید.",
+        reply_markup=keyboard.get_cancel_markup()
     )
     return GET_CHANNEL_FORWARD
+
 
 async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msg = update.message
         text = getattr(msg, 'text', '').strip()
-        
+
         # اعتبارسنجی: آیدی باید با -100 شروع شود یا @ داشته باشد
         if not text or (not text.startswith('-100') and not text.startswith('@')):
             await msg.reply_text(
@@ -2727,12 +1268,12 @@ async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         c_id = text
         c_name = "Channel (Manual)"
-        
+
         # تلاش برای گرفتن اسم کانال جهت اطمینان
         try:
             chat = await context.bot.get_chat(c_id)
             c_name = chat.title
-            c_id = str(chat.id) # تبدیل نهایی به آیدی عددی
+            c_id = str(chat.id)  # تبدیل نهایی به آیدی عددی
         except Exception as e:
             # اگر ربات ادمین نباشد یا آیدی غلط باشد
             await msg.reply_text(
@@ -2744,15 +1285,15 @@ async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
             return GET_CHANNEL_FORWARD
 
         context.user_data['new_chan'] = {'id': c_id, 'name': c_name}
-        
+
         kb = [
             [InlineKeyboardButton("🔥 فقط فشار منابع (CPU/RAM)", callback_data='type_resource')],
             [InlineKeyboardButton("🚨 فقط هشدار قطعی", callback_data='type_down'), InlineKeyboardButton("⏳ فقط انقضا", callback_data='type_expiry')],
             [InlineKeyboardButton("📊 فقط گزارشات", callback_data='type_report'), InlineKeyboardButton("✅ همه موارد", callback_data='type_all')]
         ]
-        
+
         await msg.reply_text(
-            f"✅ کانال **{c_name}** شناسایی شد.\n🆔 آیدی: `{c_id}`\n\n🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", 
+            f"✅ کانال **{c_name}** شناسایی شد.\n🆔 آیدی: `{c_id}`\n\n🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**",
             reply_markup=InlineKeyboardMarkup(kb)
         )
         return GET_CHANNEL_TYPE
@@ -2762,10 +1303,13 @@ async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE
         await msg.reply_text("❌ خطای غیرمنتظره. دوباره تلاش کنید.")
         return GET_CHANNEL_FORWARD
 
+
 async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    try: await query.answer()
-    except: pass
+    try:
+        await query.answer()
+    except:
+        pass
     usage = query.data.split('_')[1]
     cdata = context.user_data['new_chan']
     db.add_channel(update.effective_user.id, cdata['id'], cdata['name'], usage)
@@ -2773,14 +1317,18 @@ async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_
     await channels_menu(update, context)
     return ConversationHandler.END
 
+
 async def delete_channel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.delete_channel(int(update.callback_query.data.split('_')[1]), update.effective_user.id)
     await channels_menu(update, context)
 
+
 async def edit_expiry_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    try: await query.answer()
-    except: pass
+    try:
+        await query.answer()
+    except:
+        pass
     sid = query.data.split('_')[2]
     context.user_data['edit_expiry_sid'] = sid
     srv = db.get_server_by_id(sid)
@@ -2790,8 +1338,9 @@ async def edit_expiry_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"مثلاً اگر عدد `30` را بفرستید، انقضا روی ۳۰ روز دیگر تنظیم می‌شود.\n\n"
         f"♾ برای **نامحدود** کردن، عدد `0` را بفرستید."
     )
-    await safe_edit_message(update, txt, reply_markup=get_cancel_markup())
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
     return EDIT_SERVER_EXPIRY
+
 
 async def edit_expiry_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -2811,17 +1360,20 @@ async def edit_expiry_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ لطفاً فقط عدد انگلیسی وارد کنید.")
         return EDIT_SERVER_EXPIRY
 
+
 async def ask_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    try: await query.answer()
-    except: pass
-    
+    try:
+        await query.answer()
+    except:
+        pass
+
     sid = query.data.split('_')[2]
     srv = db.get_server_by_id(sid)
-    context.user_data['term_sid'] = sid 
-    
+    context.user_data['term_sid'] = sid
+
     kb = [[InlineKeyboardButton("🔙 خروج و بازگشت به پنل", callback_data='exit_terminal')]]
-    
+
     txt = (
         f"📟 **ترمینال تعاملی: {srv['name']}**\n"
         f"➖➖➖➖➖➖➖➖➖➖\n"
@@ -2829,9 +1381,10 @@ async def ask_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"هر دستوری بنویسی اجرا میشه. برای خروج دکمه پایین رو بزن.\n\n"
         f"root@{srv['ip']}:~# _"
     )
-    
+
     await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
     return GET_REMOTE_COMMAND
+
 
 async def run_terminal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmd = update.message.text
@@ -2840,333 +1393,67 @@ async def run_terminal_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     sid = context.user_data.get('term_sid')
     srv = db.get_server_by_id(sid)
-    
+
     wait_msg = await update.message.reply_text(f"⚙️ `{cmd}` ...")
-    
+
     real_pass = sec.decrypt(srv['password'])
     ok, output = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.run_remote_command, srv['ip'], srv['port'], srv['username'], real_pass, cmd)
-    
+
     if not output: output = "[No Output]"
     if len(output) > 3000: output = output[:3000] + "\n..."
     safe_output = html.escape(output)
     status = "✅" if ok else "❌"
-    
+
     terminal_view = (
         f"<code>root@{srv['ip']}:~# {cmd}</code>\n"
         f"{status}\n"
         f"<pre language='bash'>{safe_output}</pre>"
     )
-    
+
     kb = [[InlineKeyboardButton("🔙 خروج از ترمینال", callback_data='exit_terminal')]]
     await wait_msg.delete()
     try:
         await update.message.reply_text(terminal_view, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
     except:
         await update.message.reply_text(f"⚠️ Raw Output:\n{output}", reply_markup=InlineKeyboardMarkup(kb))
-    
+
     return GET_REMOTE_COMMAND
 
+
 async def close_terminal_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query: 
-        try: await update.callback_query.answer()
-        except: pass
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except:
+            pass
     sid = context.user_data.get('term_sid')
     await server_detail(update, context, custom_sid=sid)
     return ConversationHandler.END
-
-# ==============================================================================
-# ⏳ SCHEDULED JOBS
-# ==============================================================================
-async def check_bonus_expiry_job(context: ContextTypes.DEFAULT_TYPE):
-    """بررسی و حذف پاداش‌های منقضی شده"""
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    # گرفتن پاداش‌های منقضی شده
-    with db.get_connection() as conn:
-        expired_bonuses = conn.execute("SELECT * FROM temp_bonuses WHERE expires_at < ?", (now_str,)).fetchall()
-        
-        for bonus in expired_bonuses:
-            uid = bonus['user_id']
-            amount = bonus['bonus_limit']
-            
-            # گرفتن کاربر برای کاهش لیمیت
-            user = conn.execute("SELECT server_limit FROM users WHERE user_id = ?", (uid,)).fetchone()
-            if user:
-                current_limit = user['server_limit']
-                new_limit = max(0, current_limit - amount) # جلوگیری از منفی شدن
-                
-                # کاهش لیمیت
-                conn.execute("UPDATE users SET server_limit = ? WHERE user_id = ?", (new_limit, uid))
-                
-                # اطلاع رسانی به کاربر
-                try:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=f"⚠️ **پایان مهلت پاداش دعوت**\n\nیکی از پاداش‌های ۱۰ روزه شما منقضی شد و ۱ عدد از ظرفیت سرور شما کسر گردید.\nظرفیت فعلی: {new_limit}"
-                    )
-                except: pass
-            
-            # حذف از جدول پاداش‌ها
-            conn.execute("DELETE FROM temp_bonuses WHERE id = ?", (bonus['id'],))
-        
-        conn.commit()
-async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
-    users = db.get_all_users()
-    today = datetime.now().date()
-    for user in users:
-        uid = user['user_id']
-        servers = db.get_all_user_servers(uid)
-        user_channels = db.get_user_channels(uid)
-        target_channels = [c for c in user_channels if c.get('usage_type', 'all') in ['expiry', 'all']]
-        
-        for srv in servers:
-            if not srv['expiry_date']: continue
-            try:
-                exp_date = datetime.strptime(srv['expiry_date'], '%Y-%m-%d').date()
-                days_left = (exp_date - today).days
-                msg = None
-                if days_left == 3:
-                    msg = f"⚠️ **هشدار انقضا (۳ روز مانده)**\n\n🖥 سرور: `{srv['name']}`\n📅 اتمام: `{srv['expiry_date']}`\nلطفاً جهت تمدید اقدام کنید."
-                elif days_left == 0:
-                    msg = f"🚨 **هشدار نهایی (امروز تمام می‌شود)**\n\n🖥 سرور: `{srv['name']}`\nدارای انقضای امروز است!"
-                
-                if msg:
-                    try: await context.bot.send_message(uid, msg, parse_mode='Markdown')
-                    except: pass
-                    for ch in target_channels:
-                        try: await context.bot.send_message(ch['chat_id'], msg, parse_mode='Markdown')
-                        except: pass
-            except ValueError as e:
-                logger.error(f"Date format error for server {srv['id']}: {e}")
-            except Exception as e:
-                logger.error(f"Expiry Check Error: {e}")
-
-async def global_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    # --- اصلاح شده: اجرای سبک‌تر و جلوگیری از هنگ کردن ---
-    loop = asyncio.get_running_loop()
-    users_list = await loop.run_in_executor(None, db.get_all_users)
-    all_users = set([u['user_id'] for u in users_list] + [SUPER_ADMIN_ID])
-    
-    # محدودیت: فقط ۱۰ سرور همزمان چک شوند
-    semaphore = asyncio.Semaphore(10) 
-
-    async def protected_process(uid):
-        async with semaphore:
-            servers = await loop.run_in_executor(None, db.get_all_user_servers, uid)
-            if not servers: return
-
-            def get_user_settings():
-                return {
-                    'report_interval': db.get_setting(uid, 'report_interval'),
-                    'cpu': int(db.get_setting(uid, 'cpu_threshold') or 80),
-                    'ram': int(db.get_setting(uid, 'ram_threshold') or 80),
-                    'disk': int(db.get_setting(uid, 'disk_threshold') or 90),
-                    'down_alert': db.get_setting(uid, 'down_alert_enabled') == '1'
-                }
-            settings = await loop.run_in_executor(None, get_user_settings)
-            
-            await process_single_user(context, uid, servers, settings, loop)
-
-    all_tasks = []
-    for uid in all_users:
-        all_tasks.append(protected_process(uid))
-
-    if all_tasks:
-        await asyncio.gather(*all_tasks)
-
-async def process_single_user(context, uid, servers, settings, loop):
-    tasks = []
-    for s in servers:
-        if s['is_active']:
-            tasks.append(loop.run_in_executor(None, ServerMonitor.check_full_stats, s['ip'], s['port'], s['username'], sec.decrypt(s['password'])))
-        else:
-            async def fake(): return {'status': 'Disabled'}
-            tasks.append(fake())
-            
-    results = await asyncio.gather(*tasks)
-    
-    # --- شروع ساخت گزارش ---
-    header = f"📅 **گزارش خودکار ({get_jalali_str()})**\n➖➖➖➖➖➖\n"
-    report_lines = []
-    
-    for i, res in enumerate(results):
-        s_info = servers[i]
-        r = res if isinstance(res, dict) else await res
-        
-        # لاجیک ذخیره آمار و تبریک آپتایم (بدون تغییر)
-        if r.get('status') == 'Online':
-            db.add_server_stat(s_info['id'], r.get('cpu', 0), r.get('ram', 0))
-            
-            # ... (کد تبریک آپتایم که قبلا داشتید اینجا محفوظ است فرض کنید هست) ...
-            # ... (کد هشدار ورود SSH که قبلا دادم اینجا محفوظ است) ...
-
-            # لاجیک هشدار منابع (Resource Alert)
-            alert_msgs = []
-            if r['cpu'] >= settings['cpu']: alert_msgs.append(f"🧠 **CPU:** `{r['cpu']}%`")
-            if r['ram'] >= settings['ram']: alert_msgs.append(f"💾 **RAM:** `{r['ram']}%`")
-            if r['disk'] >= settings['disk']: alert_msgs.append(f"💿 **Disk:** `{r['disk']}%`")
-            
-            if alert_msgs:
-                last_alert = CPU_ALERT_TRACKER.get((uid, s_info['id']), 0)
-                if time.time() - last_alert > 3600:
-                    full_warning = (f"⚠️ **هشدار مصرف منابع**\n🖥 سرور: `{s_info['name']}`\n" + "\n".join(alert_msgs))
-                    # ارسال هشدار منابع به کاربر/کانال...
-                    try: await context.bot.send_message(uid, full_warning, parse_mode='Markdown')
-                    except: pass
-                    CPU_ALERT_TRACKER[(uid, s_info['id'])] = time.time()
-
-        # آیکون وضعیت برای گزارش کلی
-        icon = "✅" if r.get('status') == 'Online' else "❌"
-        status_txt = f"{r.get('cpu')}% CPU" if r.get('status') == 'Online' else "OFF"
-        report_lines.append(f"{icon} **{s_info['name']}** ⇽ `{status_txt}`")
-        
-        # بررسی قطعی هوشمند (Smart Down Check)
-        if settings['down_alert'] and s_info['is_active']:
-             await check_server_down_logic(context, uid, s_info, r)
-
-    # --- ارسال گزارش زمان‌بندی شده (با رفع باگ طولانی بودن پیام) ---
-    report_int = settings['report_interval']
-    if report_int and int(report_int) > 0:
-        last_run = LAST_REPORT_CACHE.get(uid, 0)
-        if time.time() - last_run > int(report_int):
-            
-            # تقسیم پیام به بخش‌های کوچک‌تر (Chunking)
-            final_msg = header + "\n".join(report_lines)
-            
-            if len(final_msg) > 4000:
-                # اگر پیام طولانی بود، خرد کن
-                chunks = [report_lines[i:i + 20] for i in range(0, len(report_lines), 20)]
-                try: await context.bot.send_message(uid, header, parse_mode='Markdown')
-                except: pass
-                
-                for chunk in chunks:
-                    chunk_text = "\n".join(chunk)
-                    try: await context.bot.send_message(uid, chunk_text, parse_mode='Markdown')
-                    except: pass
-            else:
-                # اگر کوتاه بود یکجا بفرست
-                try: await context.bot.send_message(uid, final_msg, parse_mode='Markdown')
-                except: pass
-                
-            LAST_REPORT_CACHE[uid] = time.time()
-
-async def check_server_down_logic(context, uid, s, res):
-    k = (uid, s['id'])
-    fails = SERVER_FAILURE_COUNTS.get(k, 0)
-    
-    if res['status'] == 'Offline':
-        # 🛑 قبل از اینکه بگیم سرور قطعه، از Check-Host می‌پرسیم
-        is_really_down = True
-        extra_note = ""
-
-        # فقط اگر بار اوله که متوجه قطعی میشیم چک کنیم (که اسپم API نشه)
-        if fails == 0: 
-            try:
-                # استفاده از تابع موجود در کلاس ServerMonitor
-                loop = asyncio.get_running_loop()
-                chk_ok, chk_data = await loop.run_in_executor(None, ServerMonitor.check_host_api, s['ip'])
-                
-                if chk_ok and isinstance(chk_data, dict):
-                    # بررسی می‌کنیم آیا حداقل ۳ تا نود تونستن پینگ کنن؟
-                    ok_nodes = 0
-                    for node, result in chk_data.items():
-                        if result and result[0] and result[0][0] == "OK":
-                            ok_nodes += 1
-                    
-                    if ok_nodes >= 3:
-                        is_really_down = False
-                        extra_note = "\n🛡 **نکته:** سرور از دید جهانی **آنلاین** است. احتمالاً آی‌پی ربات مسدود شده."
-            except:
-                pass # اگر چک هاست ارور داد، فرض رو بر قطعی واقعی میذاریم
-
-        if is_really_down:
-            fails += 1
-            SERVER_FAILURE_COUNTS[k] = fails
-            
-            # اگر به حد نصاب رسید هشدار بده
-            if fails == DOWN_RETRY_LIMIT:
-                alrt = (
-                    f"🚨 **هشدار قطع اتصال (CRITICAL)**\n"
-                    f"🖥 سرور: `{s['name']}`\n"
-                    f"➖➖➖➖➖➖➖➖➖➖\n"
-                    f"❌ وضعیت: **عدم دسترسی کامل**\n"
-                    f"🔍 خطا: `{res.get('error', 'Time out')}`"
-                    f"{extra_note}"
-                )
-                
-                # ارسال به کانال‌های کاربر
-                user_channels = db.get_user_channels(uid)
-                sent = False
-                for c in user_channels:
-                    if c['usage_type'] in ['down', 'all']:
-                        try: 
-                            await context.bot.send_message(c['chat_id'], alrt, parse_mode='Markdown')
-                            sent = True
-                        except: pass
-                
-                # ارسال به خود کاربر اگر کانالی نداشت
-                if not sent:
-                    try: await context.bot.send_message(uid, alrt, parse_mode='Markdown')
-                    except: pass
-                
-                db.update_status(s['id'], "Offline")
-        else:
-            # اگر واقعا داون نبود ولی ربات وصل نمیشد، کانتر رو صفر نگه دار یا ریست کن
-            SERVER_FAILURE_COUNTS[k] = 0
-
-    else:
-        # اگر سرور آنلاین شد (Recovery)
-        if fails > 0 or s['last_status'] == 'Offline':
-            SERVER_FAILURE_COUNTS[k] = 0
-            if s['last_status'] == 'Offline':
-                rec_msg = (
-                    f"✅ **اتصال برقرار شد (RECOVERY)**\n"
-                    f"🖥 سرور: `{s['name']}`\n"
-                    f"➖➖➖➖➖➖➖➖➖➖\n"
-                    f"♻️ سرور مجدداً در دسترس قرار گرفت."
-                )
-                
-                user_channels = db.get_user_channels(uid)
-                sent = False
-                for c in user_channels:
-                    if c['usage_type'] in ['down', 'all']:
-                        try: 
-                            await context.bot.send_message(c['chat_id'], rec_msg, parse_mode='Markdown')
-                            sent = True
-                        except: pass
-                if not sent:
-                    try: await context.bot.send_message(uid, rec_msg, parse_mode='Markdown')
-                    except: pass
-                db.update_status(s['id'], "Online")
 # ==============================================================================
 # 🌍 GLOBAL OPERATIONS (NEW FEATURES)
 # ==============================================================================
 
 async def global_ops_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش منوی عملیات همگانی"""
-    kb = [
-        [InlineKeyboardButton("🔄 آپدیت مخازن (همه سرورها)", callback_data='glob_act_update')],
-        [InlineKeyboardButton("🧹 پاکسازی RAM (همه سرورها)", callback_data='glob_act_ram')],
-        [InlineKeyboardButton("🗑 پاکسازی دیسک (همه سرورها)", callback_data='glob_act_disk')],
-        [InlineKeyboardButton("🛠 سرویس کامل (Full Service)", callback_data='glob_act_full')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
-    ]
-    
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.global_ops_kb()
+
     txt = (
         "🌍 **تنظیمات همگانی سرورها**\n\n"
         "در این بخش می‌تونی یک دستور رو همزمان روی **تمام سرورهای فعال** اجرا کنی.\n"
         "⚠️ نکته: عملیات ممکن است بسته به تعداد سرورها کمی طول بکشد."
     )
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
 
 async def global_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مدیریت درخواست‌های همگانی"""
     query = update.callback_query
-    action = query.data.split('_')[2] # update, ram, disk, full
+    action = query.data.split('_')[2]  # update, ram, disk, full
     uid = update.effective_user.id
     servers = db.get_all_user_servers(uid)
     active_servers = [s for s in servers if s['is_active']]
-    
+
     if not active_servers:
         await query.answer("❌ هیچ سرور فعالی نداری!", show_alert=True)
         return
@@ -3176,84 +1463,23 @@ async def global_action_handler(update: Update, context: ContextTypes.DEFAULT_TY
         "لطفاً منتظر بمانید، نتیجه نهایی ارسال خواهد شد."
     )
 
-    asyncio.create_task(run_global_commands_background(context, uid, active_servers, action))
+    asyncio.create_task(cronjobs.run_global_commands_background(context, uid, active_servers, action))
 
-async def run_global_commands_background(context, chat_id, servers, action):
-    """تابع اجرایی که روی سرورها لوپ می‌زند"""
-    results = []
-    success_count = 0
-    fail_count = 0
-    
-    msg_header = ""
-    cmd = ""
-    
-    if action == 'update':
-        msg_header = "🔄 **گزارش آپدیت همگانی**"
-        cmd = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-    elif action == 'ram':
-        msg_header = "🧹 **گزارش پاکسازی RAM**"
-        cmd = "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
-    elif action == 'disk':
-        msg_header = "🗑 **گزارش پاکسازی دیسک**"
-        cmd = (
-            "sudo apt-get autoremove -y && "
-            "sudo apt-get autoclean -y && "
-            "sudo journalctl --vacuum-size=50M && "
-            "sudo rm -rf /tmp/*"
-        )
-    elif action == 'full':
-        msg_header = "🛠 **گزارش سرویس کامل (Full Service)**"
 
-        cmd = (
-             "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
-             "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && "
-             "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' && "
-             "sudo apt-get autoremove -y && sudo apt-get autoclean -y"
-        )
-
-    for srv in servers:
-        try:
-            ok, output = await asyncio.get_running_loop().run_in_executor(
-                None, ServerMonitor.run_remote_command, 
-                srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password']), 
-                cmd, 600 
-            )
-            
-            if ok:
-                success_count += 1
-                results.append(f"✅ **{srv['name']}:** انجام شد.")
-            else:
-                fail_count += 1
-                results.append(f"❌ **{srv['name']}:** خطا\n`{str(output)[:50]}`") 
-                
-        except Exception as e:
-            fail_count += 1
-            results.append(f"❌ **{srv['name']}:** خطای اتصال")
-
-    final_report = (
-        f"{msg_header}\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📊 کل سرورها: {len(servers)}\n"
-        f"✅ موفق: {success_count} | ❌ ناموفق: {fail_count}\n\n"
-        + "\n".join(results)
-    )
-    
-    if len(final_report) > 4000:
-        final_report = final_report[:4000] + "\n...(ادامه بریده شد)"
-        
-    await context.bot.send_message(chat_id=chat_id, text=final_report, parse_mode='Markdown')
 # ==============================================================================
 # ⏱ AUTO SCHEDULE HANDLERS (CRONJOBS)
 # ==============================================================================
 
 async def auto_update_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """منوی تنظیم زمان‌بندی آپدیت خودکار"""
-    if update.callback_query: await update.callback_query.answer()
+    if update.callback_query:
+        await update.callback_query.answer()
 
     uid = update.effective_user.id
     curr = db.get_setting(uid, 'auto_update_hours') or '0'
-    
-    def st(val): return "✅" if str(val) == str(curr) else ""
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.auto_update_kb(curr)
 
     txt = (
         "🔄 **تنظیم آپدیت خودکار مخازن (APT Update)**\n"
@@ -3262,23 +1488,17 @@ async def auto_update_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👇 بازه زمانی مورد نظر را انتخاب کنید:"
     )
 
-    # تعریف دکمه‌ها
-    kb = [
-        [InlineKeyboardButton(f"{st(6)} هر ۶ ساعت", callback_data='set_autoup_6'), InlineKeyboardButton(f"{st(12)} هر ۱۲ ساعت", callback_data='set_autoup_12')],
-        [InlineKeyboardButton(f"{st(24)} هر ۲۴ ساعت", callback_data='set_autoup_24'), InlineKeyboardButton(f"{st(48)} هر ۴۸ ساعت", callback_data='set_autoup_48')],
-        [InlineKeyboardButton(f"{st(0)} ❌ غیرفعال", callback_data='set_autoup_0')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_automation')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
 async def auto_reboot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """منوی اصلی وضعیت ریبوت خودکار"""
-    if update.callback_query: await update.callback_query.answer()
+    if update.callback_query:
+        await update.callback_query.answer()
 
     uid = update.effective_user.id
     curr_setting = db.get_setting(uid, 'auto_reboot_config')
-    
+
     status_txt = "❌ غیرفعال"
     if curr_setting and curr_setting != 'OFF':
         try:
@@ -3297,66 +1517,62 @@ async def auto_reboot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "در این بخش می‌توانید تعیین کنید تمام سرورها سر ساعت مشخصی ریبوت شوند.\n\n"
         f"وضعیت فعلی: `{status_txt}`"
     )
-    
-    # تعریف دکمه‌ها
-    kb = [
-        [InlineKeyboardButton("⚙️ تنظیم زمان‌بندی جدید", callback_data='start_set_reboot')],
-        [InlineKeyboardButton("❌ غیرفعال‌سازی", callback_data='disable_reboot')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='menu_automation')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.auto_reboot_kb()
+
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
 
 async def ask_reboot_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """پرسیدن ساعت از کاربر"""
-    try: await update.callback_query.answer()
-    except: pass
-    
+    try:
+        await update.callback_query.answer()
+    except:
+        pass
+
     txt = (
         "🕰 **تنظیم ساعت ریبوت**\n\n"
         "لطفاً ساعتی که می‌خواهید ریبوت انجام شود را به صورت عدد وارد کنید.\n"
         "🔢 بازه مجاز: `0` تا `23`\n\n"
         "مثال: برای ۴ صبح عدد `4` و برای ۲ بعدازظهر عدد `14` را ارسال کنید."
     )
-    await safe_edit_message(update, txt, reply_markup=get_cancel_markup())
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
     return GET_REBOOT_TIME
+
 
 async def receive_reboot_time_and_show_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت ساعت و نمایش دکمه‌های فرکانس"""
     try:
         hour = int(update.message.text)
-        if not (0 <= hour <= 23): raise ValueError()
-        
+        if not (0 <= hour <= 23):
+            raise ValueError()
+
         time_str = f"{hour:02d}:00"
-        context.user_data['temp_reboot_time'] = time_str 
-        
+        context.user_data['temp_reboot_time'] = time_str
+
         txt = (
             f"✅ ساعت انتخاب شده: `{time_str}`\n\n"
             "📅 **حالا بازه زمانی تکرار را انتخاب کنید:**"
         )
-        
-        kb = [
-            [InlineKeyboardButton(f"هر روز ساعت {time_str}", callback_data=f'savereb_1_{time_str}')],
-            [InlineKeyboardButton(f"هر ۲ روز ساعت {time_str}", callback_data=f'savereb_2_{time_str}')],
-            [InlineKeyboardButton(f"هفته‌ای یکبار (۷ روز)", callback_data=f'savereb_7_{time_str}')],
-            [InlineKeyboardButton(f"هر ۲ هفته یکبار", callback_data=f'savereb_14_{time_str}')],
-            [InlineKeyboardButton(f"ماهانه (۳۰ روز)", callback_data=f'savereb_30_{time_str}')],
-            [InlineKeyboardButton("🔙 انصراف", callback_data='cancel_flow')]
-        ]
-        
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-        return ConversationHandler.END 
-        
+
+        # استفاده از ماژول کیبورد
+        reply_markup = keyboard.reboot_freq_kb(time_str)
+
+        await update.message.reply_text(txt, reply_markup=reply_markup, parse_mode='Markdown')
+        return ConversationHandler.END
+
     except ValueError:
         await update.message.reply_text("❌ عدد نامعتبر! لطفاً عددی بین 0 تا 23 وارد کنید.")
         return GET_REBOOT_TIME
+
 
 async def save_auto_reboot_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ذخیره نهایی تنظیمات ریبوت"""
     query = update.callback_query
     data = query.data
     uid = update.effective_user.id
-    
+
     if data == 'disable_reboot':
         db.set_setting(uid, 'auto_reboot_config', 'OFF')
         await query.answer("✅ ریبوت خودکار غیرفعال شد.", show_alert=True)
@@ -3366,234 +1582,43 @@ async def save_auto_reboot_final(update: Update, context: ContextTypes.DEFAULT_T
     parts = data.split('_')
     days = parts[1]
     time_str = parts[2]
-    
-    config_str = f"{days}|{time_str}" 
+
+    config_str = f"{days}|{time_str}"
     db.set_setting(uid, 'auto_reboot_config', config_str)
-    db.set_setting(uid, 'last_reboot_date', '2000-01-01') 
-    
+    db.set_setting(uid, 'last_reboot_date', '2000-01-01')
+
     await query.answer(f"✅ تنظیم شد: هر {days} روز ساعت {time_str}")
     await auto_reboot_menu(update, context)
-async def startup_whitelist_job(context: ContextTypes.DEFAULT_TYPE):
-    """این تابع یک بار اول کار اجرا می‌شود تا آی‌پی ربات را در همه سرورها وایت کند"""
-    loop = asyncio.get_running_loop()
-    
-    bot_ip = await loop.run_in_executor(None, ServerMonitor.get_bot_public_ip)
-    if not bot_ip:
-        logger.error("❌ Could not fetch Bot IP for Whitelisting.")
-        return
-
-    logger.info(f"🛡 Starting Global IP Whitelist (Bot IP: {bot_ip})...")
-    
-    with db.get_connection() as conn:
-        servers = conn.execute("SELECT * FROM servers").fetchall()
-
-    count = 0
-    for srv in servers:
-        try:
-            real_pass = sec.decrypt(srv['password'])
-            await loop.run_in_executor(
-                None, 
-                ServerMonitor.whitelist_bot_ip, 
-                srv['ip'], srv['port'], srv['username'], real_pass, bot_ip
-            )
-            count += 1
-        except Exception as e:
-            logger.error(f"Failed to whitelist on {srv['name']}: {e}")
-            
-    logger.info(f"✅ Whitelist process finished for {count} servers.")
 # --- تابع اجرایی جاب (Job) ---
-async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
-    """این تابع هر دقیقه اجرا می‌شود و چک می‌کند آیا وقت عملیات رسیده؟"""
-    loop = asyncio.get_running_loop()
-    users = await loop.run_in_executor(None, db.get_all_users)
-    now = time.time()
-    
-    # زمان فعلی ایران
-    tehran_now = get_tehran_datetime()
-    current_hhmm = tehran_now.strftime("%H:%M")
-    today_date_str = tehran_now.strftime("%Y-%m-%d")
-    today_date_obj = datetime.strptime(today_date_str, "%Y-%m-%d").date()
 
-    for user in users:
-        uid = user['user_id']
-        
-        # 1. چک کردن آپدیت خودکار (بدون تغییر)
-        up_interval = db.get_setting(uid, 'auto_update_hours')
-        if up_interval and up_interval != '0':
-            last_run = int(db.get_setting(uid, 'last_auto_update_run') or 0)
-            interval_sec = int(up_interval) * 3600
-            if now - last_run > interval_sec:
-                servers = db.get_all_user_servers(uid)
-                active = [s for s in servers if s['is_active']]
-                if active:
-                    try: await context.bot.send_message(uid, f"🔄 **شروع آپدیت خودکار ({up_interval} ساعته)...**")
-                    except: pass
-                    asyncio.create_task(run_global_commands_background(context, uid, active, 'update'))
-                db.set_setting(uid, 'last_auto_update_run', int(now))
 
-        # 2. چک کردن ریبوت خودکار (لاجیک جدید)
-        # فرمت کانفیگ: "DAYS|HH:MM"
-        reb_config = db.get_setting(uid, 'auto_reboot_config')
-        
-        if reb_config and reb_config != 'OFF' and '|' in reb_config:
-            try:
-                interval_days_str, target_time = reb_config.split('|')
-                interval_days = int(interval_days_str)
-                
-                # اگر ساعت فعلی با ساعت تنظیم شده یکی بود
-                if current_hhmm == target_time:
-                    last_reb_str = db.get_setting(uid, 'last_reboot_date') or '2000-01-01'
-                    last_reb_date = datetime.strptime(last_reb_str, "%Y-%m-%d").date()
-                    
-                    # محاسبه فاصله روزها
-                    days_diff = (today_date_obj - last_reb_date).days
-                    
-                    # اگر تعداد روزهای گذشته >= فاصله تنظیم شده باشد
-                    if days_diff >= interval_days:
-                        servers = db.get_all_user_servers(uid)
-                        active = [s for s in servers if s['is_active']]
-                        if active:
-                            try: await context.bot.send_message(uid, f"⚠️ **شروع ریبوت خودکار (هر {interval_days} روز - {target_time})...**")
-                            except: pass
-                            for s in active:
-                                asyncio.create_task(
-                                    run_background_ssh_task(
-                                        context, uid, 
-                                        ServerMonitor.run_remote_command, s['ip'], s['port'], s['username'], sec.decrypt(s['password']), "reboot"
-                                    )
-                                )
-                        # بروزرسانی تاریخ آخرین اجرا به امروز
-                        db.set_setting(uid, 'last_reboot_date', today_date_str)
-            except Exception as e:
-                logger.error(f"Auto Reboot Error for {uid}: {e}")
-async def auto_backup_send_job(context: ContextTypes.DEFAULT_TYPE):
-    """ارسال خودکار بکاپ هر یک ساعت"""
-    chat_id = SUPER_ADMIN_ID
-    if not chat_id: return
-
-    # 1. اطمینان از ذخیره شدن تمام داده‌ها روی دیسک
-    try:
-        with db.get_connection() as conn:
-            conn.execute("PRAGMA wal_checkpoint(FULL);")
-    except Exception as e:
-        logger.error(f"Backup Checkpoint Error: {e}")
-
-    # 2. آماده‌سازی فایل و ارسال
-    timestamp = get_tehran_datetime().strftime("%Y-%m-%d_%H-%M")
-    caption = (
-        f"📦 **بکاپ خودکار ساعتی**\n"
-        f"📅 زمان: `{get_jalali_str()}`\n"
-        f"🤖 دیتابیس ربات"
-    )
-
-    try:
-        with open(DB_NAME, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=f"backup_{timestamp}.db",
-                caption=caption,
-                parse_mode='Markdown'
-            )
-    except Exception as e:
-        logger.error(f"Auto Backup Send Failed: {e}")
 async def save_auto_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ذخیره تنظیمات آپدیت خودکار"""
     query = update.callback_query
     uid = update.effective_user.id
     hours = query.data.split('_')[2]
-    
+
     db.set_setting(uid, 'auto_update_hours', hours)
-    
+
     if hours == '0':
         msg = "❌ آپدیت خودکار غیرفعال شد."
     else:
         msg = f"✅ آپدیت خودکار تنظیم شد: هر {hours} ساعت."
-        
-    try: await query.answer(msg, show_alert=True)
-    except: pass
-    
+
+    try:
+        await query.answer(msg, show_alert=True)
+    except:
+        pass
+
     await auto_update_menu(update, context)
-# ==============================================================================
-# 💰 WALLET & PAYMENT SYSTEM
-# ==============================================================================
-
-async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """منوی اصلی کیف پول و خرید اشتراک"""
-    if update.callback_query: await update.callback_query.answer()
-    
-    uid = update.effective_user.id
-    user = db.get_user(uid)
-    
-    # تعیین نوع اشتراک فعلی
-    plan_names = {0: 'پایه (رایگان)', 1: 'برنزی 🥉', 2: 'نقره‌ای 🥈', 3: 'طلایی 🥇'}
-    current_plan = plan_names.get(user['plan_type'], 'نامشخص')
-    
-    txt = (
-        f"💎 **فروشگاه و کیف پول سونار**\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"👤 وضعیت فعلی شما:\n"
-        f"🏷 اشتراک: **{current_plan}**\n"
-        f"🖥 لیمیت سرور: `{user['server_limit']} عدد`\n"
-        f"📅 انقضا: `{user['expiry_date']}`\n\n"
-        f"🛍 **لیست اشتراک‌های قابل خرید:**\n\n"
-        
-        f"🥉 **اشتراک برنزی**\n"
-        f"├ 🖥 5 سرور\n"
-        f"├ ⏳ 30 روزه\n"
-        f"└ 💰 {SUBSCRIPTION_PLANS['bronze']['price']:,} تومان\n\n"
-        
-        f"🥈 **اشتراک نقره‌ای**\n"
-        f"├ 🖥 10 سرور\n"
-        f"├ ⏳ 30 روزه\n"
-        f"└ 💰 {SUBSCRIPTION_PLANS['silver']['price']:,} تومان\n\n"
-        
-        f"🥇 **اشتراک طلایی**\n"
-        f"├ 🖥 15 سرور\n"
-        f"├ ⏳ 30 روزه\n"
-        f"└ 💰 {SUBSCRIPTION_PLANS['gold']['price']:,} تومان\n"
-    )
-    
-    kb = [
-        [InlineKeyboardButton("🥉 خرید برنزی", callback_data='buy_plan_bronze')],
-        [InlineKeyboardButton("🥈 خرید نقره‌ای", callback_data='buy_plan_silver')],
-        [InlineKeyboardButton("🥇 خرید طلایی", callback_data='buy_plan_gold')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
-    ]
-    
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """انتخاب روش پرداخت"""
-    query = update.callback_query
-    plan_key = query.data.split('_')[2]  # buy_plan_bronze -> bronze
-    plan = SUBSCRIPTION_PLANS[plan_key]
-    
-    context.user_data['selected_plan'] = plan_key
-    
-    txt = (
-        f"🛍 **تایید فاکتور خرید**\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📦 سرویس: {plan['name']}\n"
-        f"💰 مبلغ قابل پرداخت: `{plan['price']:,} تومان`\n\n"
-        f"💳 **لطفاً روش پرداخت را انتخاب کنید:**"
-    )
-    
-    kb = [
-        [InlineKeyboardButton("💳 کارت به کارت (Toman)", callback_data='pay_method_card')],
-        [InlineKeyboardButton("💎 ارز دیجیتال (TRX/USDT)", callback_data='pay_method_tron')],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='wallet_menu')]
-    ]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
 async def show_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """نمایش اطلاعات پرداخت (داینامیک از دیتابیس)"""
     query = update.callback_query
-    method_type = query.data.split('_')[2] # card or tron (که ما در دیتابیس card/crypto داریم)
-    
+    method_type = query.data.split('_')[2]  # card or tron (که ما در دیتابیس card/crypto داریم)
+
     # مپ کردن دکمه‌های قدیمی به تایپ‌های دیتابیس
     db_type = 'card' if method_type == 'card' else 'crypto'
-    
+
     plan_key = context.user_data.get('selected_plan')
     if not plan_key:
         await wallet_menu(update, context)
@@ -3601,17 +1626,17 @@ async def show_payment_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
     plan = SUBSCRIPTION_PLANS[plan_key]
     user_id = update.effective_user.id
-    
+
     # دریافت روش‌های فعال از دیتابیس
     methods = db.get_payment_methods(db_type)
-    
+
     if not methods:
         await safe_edit_message(update, "❌ متاسفانه در حال حاضر هیچ روش پرداختی برای این گزینه فعال نیست.\nلطفاً با پشتیبانی تماس بگیرید.")
         return
 
     # ثبت سفارش اولیه
     pay_id = db.create_payment(user_id, plan_key, plan['price'], method_type)
-    
+
     details_txt = ""
     if db_type == 'card':
         details_txt = f"💳 **شماره کارت‌های فعال:**\n\n"
@@ -3623,8 +1648,8 @@ async def show_payment_details(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"──────────────\n"
             )
         amount_txt = f"💰 مبلغ قابل پرداخت: `{plan['price']:,} تومان`"
-        
-    else: # Crypto
+
+    else:  # Crypto
         details_txt = f"💎 **آدرس‌های واریز (Crypto):**\n\n"
         for m in methods:
             details_txt += (
@@ -3645,30 +1670,31 @@ async def show_payment_details(update: Update, context: ContextTypes.DEFAULT_TYP
         f"۲. اسکرین‌شات تراکنش را آماده کنید.\n"
         f"۳. دکمه **'✅ پرداخت کردم'** را بزنید."
     )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.confirm_payment_kb(pay_id)
     
-    kb = [
-        [InlineKeyboardButton("✅ پرداخت کردم (ارسال رسید)", callback_data=f'confirm_pay_{pay_id}')],
-        [InlineKeyboardButton("🔙 انصراف", callback_data='wallet_menu')]
-    ]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
 
 async def ask_for_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مرحله ۱: درخواست ارسال رسید از کاربر"""
     query = update.callback_query
     # فرمت دیتا: confirm_pay_ID
     pay_id = query.data.split('_')[2]
-    
+
     # ذخیره آیدی پرداخت در حافظه موقت برای مرحله بعد
     context.user_data['current_pay_id'] = pay_id
-    
+
     txt = (
         "📸 **لطفاً تصویر رسید پرداخت را ارسال کنید.**\n\n"
         "می‌توانید عکس بگیرید یا فایل (Screenshot) بفرستید.\n"
         "برای انصراف دکمه زیر را بزنید."
     )
-    
-    await safe_edit_message(update, txt, reply_markup=get_cancel_markup())
+
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
     return GET_RECEIPT
+
 
 async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """مرحله ۲: دریافت عکس، ذخیره و ارسال برای ادمین"""
@@ -3678,11 +1704,12 @@ async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     user = update.effective_user
-    
+
     # پیدا کردن اطلاعات پرداخت از دیتابیس
-    with db.get_connection() as conn:
-        pay_info = conn.execute("SELECT * FROM payments WHERE id=?", (pay_id,)).fetchone()
-    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM payments WHERE id=%s", (pay_id,))
+        pay_info = cur.fetchone()
+
     if not pay_info:
         await update.message.reply_text("❌ تراکنش یافت نشد.")
         return ConversationHandler.END
@@ -3704,13 +1731,13 @@ async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_T
         "✅ **رسید شما دریافت شد!**\n\n"
         "مدیران سیستم پس از بررسی صحت پرداخت، اشتراک شما را فعال خواهند کرد.\n"
         "این فرآیند معمولاً کمتر از ۱ ساعت زمان می‌برد.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]])
+        reply_markup=keyboard.back_btn()
     )
 
     # --- ارسال به ادمین ---
     plan = SUBSCRIPTION_PLANS.get(pay_info['plan_type'])
     plan_name = plan['name'] if plan else "Unknown"
-    
+
     admin_caption = (
         f"💰 **درخواست پرداخت جدید (همراه با رسید)**\n"
         f"➖➖➖➖➖➖➖➖➖➖\n"
@@ -3721,11 +1748,9 @@ async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_T
         f"🔢 شناسه پرداخت: `{pay_id}`\n\n"
         f"⚠️ لطفاً رسید را چک کنید و تصمیم بگیرید."
     )
-    
-    admin_kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ تایید و فعال‌سازی", callback_data=f'admin_approve_pay_{pay_id}')],
-        [InlineKeyboardButton("❌ رد کردن (فیک)", callback_data=f'admin_reject_pay_{pay_id}')]
-    ])
+
+    # استفاده از ماژول کیبورد
+    admin_kb = keyboard.admin_receipt_kb(pay_id)
 
     try:
         if is_document:
@@ -3739,37 +1764,40 @@ async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_T
 
     return ConversationHandler.END
 
+
 async def admin_approve_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """تایید نهایی توسط ادمین"""
     query = update.callback_query
     pay_id = query.data.split('_')[3]
-    
+
     res = db.approve_payment(pay_id)
-    
+
     if res:
         user_id, plan_name = res
         await safe_edit_message(update, f"✅ پرداخت #{pay_id} تایید شد.\nسرویس {plan_name} برای کاربر فعال گردید.")
         try:
             await context.bot.send_message(chat_id=user_id, text=f"🎉 **تبریک! پرداخت شما تایید شد.**\n\n✅ اشتراک **{plan_name}** فعال شد.")
-        except: pass
+        except:
+            pass
     else:
         await safe_edit_message(update, "❌ خطا: این پرداخت قبلاً تایید شده است.")
+
 
 async def admin_reject_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pay_id = update.callback_query.data.split('_')[3]
     await safe_edit_message(update, f"❌ پرداخت #{pay_id} رد شد.")
-
 async def referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """منوی سیستم دعوت پیشرفته"""
-    if update.callback_query: await update.callback_query.answer()
-    
+    if update.callback_query:
+        await update.callback_query.answer()
+
     uid = update.effective_user.id
     user = db.get_user(uid)
     bot_username = context.bot.username
-    
+
     invite_link = f"https://t.me/{bot_username}?start={uid}"
     ref_count = user['referral_count'] if user['referral_count'] else 0
-    
+
     txt = (
         f"💎 **کمپین بزرگ دعوت دوستان**\n"
         f"➖➖➖➖➖➖➖➖➖➖\n"
@@ -3785,43 +1813,2663 @@ async def referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 **لینک اختصاصی شما (لمس کنید):**\n"
         f"`{invite_link}`"
     )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.referral_kb(invite_link)
     
-    kb = [
-        [InlineKeyboardButton("📲 اشتراک‌گذاری سریع", url=f"https://t.me/share/url?url={invite_link}&text=ربات%20مدیریت%20سرور%20حرفه%20ای%20سونار")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
+# ==============================================================================
+# 📊 DASHBOARD SORTING FEATURES
+# ==============================================================================
+async def dashboard_sort_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی انتخاب نوع مرتب‌سازی"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except:
+        pass
+
+    # حالت فعلی رو می‌خونیم
+    current_sort = context.user_data.get('dash_sort', 'id')
+
+    txt = (
+        "📊 **تنظیمات نمایش داشبورد**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "می‌خواهید لیست سرورها بر چه اساسی مرتب شود؟"
+    )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.dashboard_sort_kb(current_sort)
+
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
+async def set_dashboard_sort_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ذخیره انتخاب کاربر و بازگشت به داشبورد"""
+    query = update.callback_query
+    sort_type = query.data.split('_')[3]  # uptime, traffic, etc.
+
+    context.user_data['dash_sort'] = sort_type
+
+    # ترجمه فارسی برای پیام تایید
+    names = {'uptime': 'آپتایم', 'traffic': 'ترافیک', 'resource': 'منابع', 'id': 'زمان ثبت'}
+    await query.answer(f"✅ مرتب‌سازی بر اساس {names.get(sort_type)} تنظیم شد.")
+
+    # مستقیم برمی‌گردیم به داشبورد با تنظیمات جدید
+    await status_dashboard(update, context)
+# ==============================================================================
+# 🎯 ADMIN REPORTS (ADVANCED)
+# ==============================================================================
+
+# State for User ID Input
+ADMIN_GET_UID_FOR_REPORT = range(300)
+async def admin_server_detail_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش حرفه‌ای جزئیات سرور (استفاده مجدد از server_detail)"""
+    sid = update.callback_query.data.split('_')[2]
+    # از تابع موجود server_detail استفاده می‌شود
+    await server_detail(update, context, custom_sid=sid)
+# ==============================================================================
+# 📡 TUNNEL MONITORING ADMIN FLOW (REWRITTEN & ADVANCED)
+# ==============================================================================
+
+async def monitor_settings_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پنل مدیریت سرور مانیتورینگ (هوشمند)"""
+    uid = update.effective_user.id
+    if uid != SUPER_ADMIN_ID: return
+    
+    if update.callback_query:
+        try: await update.callback_query.answer()
+        except: pass
+
+    # بررسی اینکه آیا سرور مانیتورینگ وجود دارد یا خیر
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1")
+        monitor = cur.fetchone()
+
+    # استفاده از ماژول کیبورد
+    is_set = monitor is not None
+    reply_markup = keyboard.monitor_node_kb(is_set)
+
+    if not monitor:
+        # --- حالت اول: هنوز سرور ست نشده ---
+        desc = (
+            "📡 **سیستم مانیتورینگ تانل (Iran Node)**\n"
+            "➖➖➖➖➖➖➖➖➖➖\n"
+            "در این سیستم، یک سرور ایران وظیفه تست مداوم کانفیگ‌های شما را بر عهده می‌گیرد.\n\n"
+            "⚠️ **وضعیت فعلی:** هنوز سرور ایران ست نشده است.\n\n"
+            "✅ با کلیک بر روی دکمه زیر، مراحل نصب خودکار آغاز می‌شود:"
+        )
+    else:
+        # --- حالت دوم: سرور فعال است ---
+        ip_censored = monitor['ip'] # نمایش آی‌پی
+        desc = (
+            "📡 **سیستم مانیتورینگ تانل (Iran Node)**\n"
+            "➖➖➖➖➖➖➖➖➖➖\n"
+            f"✅ **وضعیت:** فعال و متصل\n"
+            f"🖥 **نام سرور:** `{monitor['name']}`\n"
+            f"🌐 **آی‌پی:** `{ip_censored}`\n\n"
+            "📂 **مدیریت فایل‌ها و ارتباط:**"
+        )
+
+    await safe_edit_message(update, desc, reply_markup=reply_markup)
+
+
+# --- استیت‌های دریافت مشخصات سرور ایران ---
+async def set_iran_monitor_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "📝 **یک نام برای سرور ایران انتخاب کنید:**\n(مثلاً: Iran-MCI)", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_NAME
+
+async def get_iran_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_name'] = update.message.text
+    await update.message.reply_text("🇮🇷 **آی‌پی سرور ایران را وارد کنید:**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_IP
+
+async def get_iran_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_ip'] = update.message.text
+    await update.message.reply_text("🔌 **پورت اتصال SSH را وارد کنید (پیش‌فرض 22):**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_PORT
+
+async def get_iran_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        port = int(update.message.text)
+        context.user_data['iran_port'] = port
+        await update.message.reply_text("👤 **نام کاربری (Username) سرور ایران:**\n(معمولاً root)", reply_markup=keyboard.get_cancel_markup())
+        return GET_IRAN_USER
+    except:
+        await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
+        return GET_IRAN_PORT
+
+async def get_iran_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_user'] = update.message.text
+    await update.message.reply_text("🔑 **رمز عبور (Password) سرور ایران:**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_PASS
+
+async def get_iran_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
+    
+    # اطلاعات جمع آوری شده
+    name = context.user_data.get('iran_name')
+    ip = context.user_data.get('iran_ip')
+    port = context.user_data.get('iran_port')
+    user = context.user_data.get('iran_user')
+
+    if not name or not ip:
+        await update.message.reply_text("⚠️ اطلاعات ناقص است. مجدد تلاش کنید.")
+        return ConversationHandler.END
+
+    # پیام اولیه (شروع عملیات)
+    progress_msg = await update.message.reply_text(
+        "🚀 **آغاز عملیات نصب و راه‌اندازی...**\n"
+        "⏳ در حال برقراری ارتباط با سرور ایران..."
+    )
+
+    loop = asyncio.get_running_loop()
+
+    # --- تابع داخلی برای اجرای مراحل نصب ---
+    def install_process_sync():
+        log_steps = []
+        client = None
+        try:
+            # 1. اتصال
+            client = ServerMonitor.get_ssh_client(ip, port, user, password)
+            log_steps.append("✅ اتصال SSH برقرار شد.")
+            
+            # 2. آماده‌سازی محیط لاگ
+            # ساخت فایل لاگ و دادن دسترسی کامل برای ثبت ریزترین خطاها
+            log_setup_cmd = "touch /root/agent_debug.log && chmod 777 /root/agent_debug.log && echo '--- LOG STARTED ---' > /root/agent_debug.log"
+            client.exec_command(log_setup_cmd)
+            log_steps.append("📝 فایل لاگ دیباگ ساخته شد.")
+
+            # 3. آپلود فایل ایجنت
+            sftp = client.open_sftp()
+            try:
+                sftp.mkdir("/root/xray_workspace")
+            except: pass # اگر پوشه بود خطا نده
+            
+            with sftp.file("/root/monitor_agent.py", "w") as remote_file:
+                remote_file.write(get_agent_content())
+            sftp.close()
+            log_steps.append("📂 فایل مانیتورینگ منتقل شد.")
+
+            # 4. نصب پیش‌نیازها و Xray (این مرحله زمان‌بر است)
+            log_steps.append("📦 در حال نصب پکیج‌ها (Python, Curl, Unzip)...")
+            
+            # دستور نصب (بدون پرسش)
+            setup_cmd = (
+                "export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -y > /dev/null 2>&1 && "
+                "apt-get install -y python3 python3-requests curl unzip > /dev/null 2>&1 && " # 👈 python3-requests اضافه شد
+                "chmod +x /root/monitor_agent.py"
+            )
+            
+            # اجرا با timeout بالا چون آپدیت مخازن ایران کند است
+            stdin, stdout, stderr = client.exec_command(setup_cmd, timeout=300)
+            exit_status = stdout.channel.recv_exit_status()
+            
+            if exit_status != 0:
+                err = stderr.read().decode()
+                raise Exception(f"خطا در نصب پکیج‌ها: {err}")
+            
+            log_steps.append("✅ نصب پکیج‌ها با موفقیت انجام شد.")
+            client.close()
+            return True, log_steps
+
+        except Exception as e:
+            if client: client.close()
+            return False, str(e)
+
+    # --- اجرای مرحله به مرحله در ترد جداگانه (چون SSH بلاک‌کننده است) ---
+    # اما چون می‌خواهیم پیام آپدیت شود، کمی تریک می‌زنیم یا کل فانکشن را یکجا اجرا می‌کنیم
+    # برای سادگی و جلوگیری از هنگ کردن بات، کل پروسه را در executor می‌بریم
+    # و فقط نتیجه نهایی را چک می‌کنیم (یا می‌توانیم لاجیک پیچیده‌تر برای استریم داشته باشیم)
+    # اینجا برای تجربه کاربری بهتر، پیام را چند بار فیک آپدیت می‌کنیم تا حس انجام کار بدهد
+    
+    # تسک واقعی در پس‌زمینه
+    task = loop.run_in_executor(None, install_process_sync)
+    
+    # حلقه نمایش وضعیت فیک (چون دسترسی به لاگ لحظه‌ای ترد سخت است)
+    steps_visual = [
+        "📂 در حال انتقال فایل‌های سیستمی...",
+        "📝 در حال تنظیم سیستم لاگ‌برداری دقیق...",
+        "📦 در حال نصب Xray Core و وابستگی‌ها...",
+        "☕️ لطفاً صبر کنید (سرورهای ایران کند هستند)...",
+        "⚙️ در حال پیکربندی نهایی..."
     ]
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+    
+    for step in steps_visual:
+        if task.done(): break
+        try:
+            await progress_msg.edit_text(f"🚀 **نصب خودکار روی سرور ایران**\n\n{step}\n⏳ لطفاً صبر کنید...")
+        except: pass
+        await asyncio.sleep(4) # هر ۴ ثانیه پیام عوض شود
+
+    # انتظار برای پایان واقعی کار
+    success, result = await task
+    
+    if success:
+        # ثبت در دیتابیس
+        real_name = f"🇮🇷 {name}"
+        encrypted_pass = sec.encrypt(password)
+        
+        try:
+            with db.get_connection() as (conn, cur):
+                # غیرفعال کردن مانیتورهای قبلی
+                cur.execute("UPDATE servers SET is_monitor_node = 0")
+                
+                # حذف اگر قبلاً با این نام بوده
+                cur.execute("DELETE FROM servers WHERE owner_id = %s AND name = %s", (SUPER_ADMIN_ID, real_name))
+                
+                # ایجاد جدید
+                cur.execute('''
+                    INSERT INTO servers (owner_id, name, ip, port, username, password, is_monitor_node, is_active, location_type, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 1, 1, 'ir', NOW())
+                ''', (SUPER_ADMIN_ID, real_name, ip, port, user, encrypted_pass))
+                conn.commit()
+
+            await progress_msg.edit_text(
+                f"✅ **عملیات با موفقیت تکمیل شد!**\n\n"
+                f"🔹 فایل مانیتورینگ نصب شد.\n"
+                f"🔹 فایل لاگ `agent_debug.log` ساخته شد.\n"
+                f"🔹 سرور به عنوان نود مانیتورینگ فعال گردید.\n\n"
+                f"از این پس تست کانفیگ‌ها از طریق این سرور انجام می‌شود."
+            )
+            # بازگشت به پنل مانیتورینگ برای دیدن گزینه‌های جدید
+            await asyncio.sleep(3)
+            await monitor_settings_panel(update, context)
+
+        except Exception as e:
+            await progress_msg.edit_text(f"❌ خطا در ذخیره دیتابیس:\n{e}")
+    else:
+        # نمایش خطا
+        await progress_msg.edit_text(f"❌ **عملیات شکست خورد!**\n\nخطا: `{result}`")
+
+    return ConversationHandler.END
+
+
+async def delete_monitor_node(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف فایل‌ها از سرور ایران و قطع ارتباط"""
+    query = update.callback_query
+    await query.answer("🗑 در حال حذف فایل‌ها و قطع ارتباط...", show_alert=True)
+    msg = await query.message.reply_text("⏳ **در حال پاکسازی سرور ایران...**")
+
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1")
+        monitor = cur.fetchone()
+
+    if not monitor:
+        await msg.edit_text("❌ سروری یافت نشد.")
+        return
+
+    # دستورات پاکسازی
+    cleanup_cmd = "rm -rf /root/monitor_agent.py /root/agent_debug.log /root/xray_workspace"
+    
+    loop = asyncio.get_running_loop()
+    try:
+        # تلاش برای وصل شدن و پاک کردن فایل‌ها
+        await loop.run_in_executor(
+            None, ServerMonitor.run_remote_command, 
+            monitor['ip'], monitor['port'], monitor['username'], sec.decrypt(monitor['password']),
+            cleanup_cmd, 20
+        )
+        server_cleaned = True
+    except:
+        server_cleaned = False # شاید سرور خاموشه، ولی از دیتابیس پاک میکنیم
+
+    # حذف از دیتابیس (یا فقط برداشتن فلگ مانیتور)
+    db.delete_server(monitor['id'], SUPER_ADMIN_ID)
+
+    text = "✅ **ارتباط قطع شد.**\n"
+    text += "🔹 سرور از لیست ربات حذف شد.\n"
+    if server_cleaned:
+        text += "🔹 فایل‌های مانیتورینگ و لاگ‌ها از سرور ایران پاک شدند."
+    else:
+        text += "⚠️ نکته: نتوانستیم به سرور وصل شویم تا فایل‌ها را پاک کنیم (احتمالاً سرور خاموش است)."
+
+    await msg.edit_text(text)
+    await asyncio.sleep(2)
+    await monitor_settings_panel(update, context)
+async def update_monitor_node(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بررسی بروزرسانی و ریپلیس کردن فایل‌ها"""
+    query = update.callback_query
+    await query.answer("🔄 در حال بررسی و آپدیت فایل‌ها...", show_alert=True)
+    msg = await query.message.reply_text("⏳ **در حال بروزرسانی فایل‌های سرور ایران...**")
+
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1")
+        monitor = cur.fetchone()
+
+    if not monitor:
+        await msg.edit_text("❌ سرور مانیتورینگ یافت نشد.")
+        return
+
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+
+    loop = asyncio.get_running_loop()
+
+    def update_process():
+        try:
+            client = ServerMonitor.get_ssh_client(ip, port, user, password)
+            sftp = client.open_sftp()
+            
+            # آپلود مجدد فایل ایجنت (جایگزینی)
+            with sftp.file("/root/monitor_agent.py", "w") as remote_file:
+                remote_file.write(get_agent_content())
+            sftp.close()
+            
+            # اطمینان از وجود فایل لاگ و دسترسی‌ها
+            cmds = (
+                "chmod +x /root/monitor_agent.py && "
+                "touch /root/agent_debug.log && "
+                "chmod 777 /root/agent_debug.log && "
+                "echo '--- UPDATED AT $(date) ---' >> /root/agent_debug.log"
+            )
+            client.exec_command(cmds)
+            client.close()
+            return True, "Success"
+        except Exception as e:
+            return False, str(e)
+
+    success, result = await loop.run_in_executor(None, update_process)
+
+    if success:
+        await msg.edit_text(
+            "✅ **بروزرسانی موفقیت‌آمیز بود.**\n\n"
+            "🔹 فایل `monitor_agent.py` جایگزین شد.\n"
+            "🔹 دسترسی فایل لاگ بررسی شد.\n"
+            "🔹 سیستم آماده کار است."
+        )
+    else:
+        await msg.edit_text(f"❌ **خطا در بروزرسانی:**\n`{result}`")
+
+# ==============================================================================
+# 🎮 UI HELPERS & GENERAL HANDLERS
+# ==============================================================================
+# get_cancel_markup حذف شد چون در ماژول کیبورد وجود دارد
+
+async def safe_edit_message(update: Update, text, reply_markup=None, parse_mode='Markdown'):
+    try:
+        if update.callback_query:
+            # اگر متن و کیبورد تغییر نکرده باشد، تلگرام ارور میدهد. اینجا هندل میکنیم
+            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        elif update.message:
+            await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        # اگر ارور این بود که "پیام تغییر نکرده"، نادیده بگیر
+        if "Message is not modified" in str(e):
+            return
+        logger.error(f"Edit Error: {e}")
+    except Exception as e:
+        logger.error(f"General Edit Error: {e}")
+
+
+async def cancel_handler_func(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except:
+            pass
+    await safe_edit_message(update, "🚫 **عملیات لغو شد.**")
+    await asyncio.sleep(1)
+    await start(update, context)
+    return ConversationHandler.END
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ارسال لاگ خطا به ادمین در تلگرام"""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # ساخت متن کامل خطا
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    
+    # پیام خطا برای ارسال به ادمین
+    message = (
+        f"🚨 **CRITICAL ERROR** 🚨\n\n"
+        f"Update: <pre>{html.escape(str(update))}</pre>\n\n"
+        f"❌ Error:\n<pre>{html.escape(tb_string[-3500:])}</pre>"
+    )
+    
+    # چاپ در کنسول برای اطمینان
+    print(tb_string)
+
+    # ارسال به تلگرام ادمین
+    try:
+        if SUPER_ADMIN_ID:
+            await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=message, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Failed to send error log to admin: {e}")
+async def run_background_ssh_task(context: ContextTypes.DEFAULT_TYPE, chat_id, func, *args):
+    loop = asyncio.get_running_loop()
+    try:
+        ok, output = await loop.run_in_executor(None, func, *args)
+        clean_out = html.escape(str(output))
+        if len(clean_out) > 3500:
+            clean_out = clean_out[:3500] + "\n... (Output Truncated)"
+
+        status_icon = "✅ عملیات با موفقیت انجام شد." if ok else "❌ عملیات با خطا مواجه شد."
+        msg_text = (
+            f"{status_icon}\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"<pre>{clean_out}</pre>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='HTML')
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ خطای غیرمنتظره در عملیات پس‌زمینه:\n{e}")
+
+async def show_payment_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش اطلاعات پرداخت (داینامیک از دیتابیس)"""
+    query = update.callback_query
+    method_type = query.data.split('_')[2]  # card or tron (که ما در دیتابیس card/crypto داریم)
+
+    # مپ کردن دکمه‌های قدیمی به تایپ‌های دیتابیس
+    db_type = 'card' if method_type == 'card' else 'crypto'
+
+    plan_key = context.user_data.get('selected_plan')
+    if not plan_key:
+        await wallet_menu(update, context)
+        return
+
+    plan = SUBSCRIPTION_PLANS[plan_key]
+    user_id = update.effective_user.id
+
+    # دریافت روش‌های فعال از دیتابیس
+    methods = db.get_payment_methods(db_type)
+
+    if not methods:
+        await safe_edit_message(update, "❌ متاسفانه در حال حاضر هیچ روش پرداختی برای این گزینه فعال نیست.\nلطفاً با پشتیبانی تماس بگیرید.")
+        return
+
+    # ثبت سفارش اولیه
+    pay_id = db.create_payment(user_id, plan_key, plan['price'], method_type)
+
+    details_txt = ""
+    if db_type == 'card':
+        details_txt = f"💳 **شماره کارت‌های فعال:**\n\n"
+        for m in methods:
+            details_txt += (
+                f"🏦 **{m['network']}**\n"
+                f"👤 {m['holder_name']}\n"
+                f"🔢 `{m['address']}`\n"
+                f"──────────────\n"
+            )
+        amount_txt = f"💰 مبلغ قابل پرداخت: `{plan['price']:,} تومان`"
+
+    else:  # Crypto
+        details_txt = f"💎 **آدرس‌های واریز (Crypto):**\n\n"
+        for m in methods:
+            details_txt += (
+                f"🪙 **شبکه: {m['network']}**\n"
+                f"🔗 آدرس:\n`{m['address']}`\n"
+                f"(روی آدرس بزنید کپی می‌شود)\n"
+                f"──────────────\n"
+            )
+        # اینجا مبلغ تومانی است. اگر بخواهید تتری باشد باید نرخ تبدیل داشته باشید
+        # فعلاً همان تومانی را نمایش می‌دهیم
+        amount_txt = f"💰 مبلغ معادل تومن: `{plan['price']:,} تومان`\n⚠️ لطفاً معادل تتری/ارزی را محاسبه و واریز کنید."
+
+    txt = (
+        f"{details_txt}"
+        f"{amount_txt}\n\n"
+        f"📝 **دستورالعمل:**\n"
+        f"۱. مبلغ را به یکی از روش‌های بالا واریز کنید.\n"
+        f"۲. اسکرین‌شات تراکنش را آماده کنید.\n"
+        f"۳. دکمه **'✅ پرداخت کردم'** را بزنید."
+    )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.confirm_payment_kb(pay_id)
+    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
+async def ask_for_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مرحله ۱: درخواست ارسال رسید از کاربر"""
+    query = update.callback_query
+    # فرمت دیتا: confirm_pay_ID
+    pay_id = query.data.split('_')[2]
+
+    # ذخیره آیدی پرداخت در حافظه موقت برای مرحله بعد
+    context.user_data['current_pay_id'] = pay_id
+
+    txt = (
+        "📸 **لطفاً تصویر رسید پرداخت را ارسال کنید.**\n\n"
+        "می‌توانید عکس بگیرید یا فایل (Screenshot) بفرستید.\n"
+        "برای انصراف دکمه زیر را بزنید."
+    )
+
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
+    return GET_RECEIPT
+
+
+async def process_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مرحله ۲: دریافت عکس، ذخیره و ارسال برای ادمین"""
+    pay_id = context.user_data.get('current_pay_id')
+    if not pay_id:
+        await update.message.reply_text("❌ خطای نشست. لطفاً دوباره تلاش کنید.")
+        return ConversationHandler.END
+
+    user = update.effective_user
+
+    # پیدا کردن اطلاعات پرداخت از دیتابیس
+    with db.get_connection() as (conn, cur):
+        pay_info = cur.execute("SELECT * FROM payments WHERE id=?", (pay_id,)).fetchone()
+
+    if not pay_info:
+        await update.message.reply_text("❌ تراکنش یافت نشد.")
+        return ConversationHandler.END
+
+    # تشخیص نوع فایل ارسالی (عکس فشرده یا فایل)
+    if update.message.photo:
+        # همیشه باکیفیت‌ترین عکس (آخرین در لیست) را برمی‌داریم
+        file_id = update.message.photo[-1].file_id
+        is_document = False
+    elif update.message.document:
+        file_id = update.message.document.file_id
+        is_document = True
+    else:
+        await update.message.reply_text("❌ لطفاً فقط **عکس** یا **فایل تصویری** ارسال کنید.")
+        return GET_RECEIPT
+
+    # پیام تشکر به کاربر
+    await update.message.reply_text(
+        "✅ **رسید شما دریافت شد!**\n\n"
+        "مدیران سیستم پس از بررسی صحت پرداخت، اشتراک شما را فعال خواهند کرد.\n"
+        "این فرآیند معمولاً کمتر از ۱ ساعت زمان می‌برد.",
+        reply_markup=keyboard.back_btn()
+    )
+
+    # --- ارسال به ادمین ---
+    plan = SUBSCRIPTION_PLANS.get(pay_info['plan_type'])
+    plan_name = plan['name'] if plan else "Unknown"
+
+    admin_caption = (
+        f"💰 **درخواست پرداخت جدید (همراه با رسید)**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"👤 کاربر: {user.full_name} (`{user.id}`)\n"
+        f"📦 سرویس: {plan_name}\n"
+        f"💵 مبلغ: {pay_info['amount']:,}\n"
+        f"💳 روش: {pay_info['method']}\n"
+        f"🔢 شناسه پرداخت: `{pay_id}`\n\n"
+        f"⚠️ لطفاً رسید را چک کنید و تصمیم بگیرید."
+    )
+
+    # استفاده از ماژول کیبورد
+    admin_kb = keyboard.admin_receipt_kb(pay_id)
+
+    try:
+        if is_document:
+            await context.bot.send_document(chat_id=SUPER_ADMIN_ID, document=file_id, caption=admin_caption, reply_markup=admin_kb, parse_mode='Markdown')
+        else:
+            await context.bot.send_photo(chat_id=SUPER_ADMIN_ID, photo=file_id, caption=admin_caption, reply_markup=admin_kb, parse_mode='Markdown')
+    except Exception as e:
+        logger.error(f"Failed to send receipt to admin: {e}")
+        # اگر ارسال عکس شکست خورد، متنی بفرست
+        await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=admin_caption + "\n\n❌ (عکس رسید ارسال نشد، خطا در تلگرام)", reply_markup=admin_kb)
+
+    return ConversationHandler.END
+
+
+async def admin_approve_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تایید نهایی توسط ادمین"""
+    query = update.callback_query
+    pay_id = query.data.split('_')[3]
+
+    res = db.approve_payment(pay_id)
+
+    if res:
+        user_id, plan_name = res
+        await safe_edit_message(update, f"✅ پرداخت #{pay_id} تایید شد.\nسرویس {plan_name} برای کاربر فعال گردید.")
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"🎉 **تبریک! پرداخت شما تایید شد.**\n\n✅ اشتراک **{plan_name}** فعال شد.")
+        except:
+            pass
+    else:
+        await safe_edit_message(update, "❌ خطا: این پرداخت قبلاً تایید شده است.")
+
+
+async def admin_reject_payment_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pay_id = update.callback_query.data.split('_')[3]
+    await safe_edit_message(update, f"❌ پرداخت #{pay_id} رد شد.")
+async def referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی سیستم دعوت پیشرفته"""
+    if update.callback_query:
+        await update.callback_query.answer()
+
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    bot_username = context.bot.username
+
+    invite_link = f"https://t.me/{bot_username}?start={uid}"
+    ref_count = user['referral_count'] if user['referral_count'] else 0
+
+    txt = (
+        f"💎 **کمپین بزرگ دعوت دوستان**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"دوستات رو دعوت کن، سرور رایگان بگیر! 🎁\n\n"
+        f"🔰 **قوانین و پاداش‌ها:**\n"
+        f"به ازای هر نفری که با لینک شما عضو شود:\n\n"
+        f"1️⃣ **+10 روز** به اعتبار کل اکانتت اضافه میشه ⏳\n"
+        f"2️⃣ **+1 عدد** ظرفیت سرور هدیه می‌گیری 🖥\n"
+        f"   ╰ *(نکته: ظرفیت هدیه ۱۰ روزه است و بعد از آن منقضی می‌شود)*\n\n"
+        f"📊 **عملکرد شما:**\n"
+        f"👥 تعداد زیرمجموعه: `{ref_count} نفر`\n"
+        f"📅 اعتبار فعلی شما: `{user['expiry_date']}`\n\n"
+        f"🔗 **لینک اختصاصی شما (لمس کنید):**\n"
+        f"`{invite_link}`"
+    )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.referral_kb(invite_link)
+    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
+# ==============================================================================
+# 📊 DASHBOARD SORTING FEATURES
+# ==============================================================================
+async def dashboard_sort_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی انتخاب نوع مرتب‌سازی"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except:
+        pass
+
+    # حالت فعلی رو می‌خونیم
+    current_sort = context.user_data.get('dash_sort', 'id')
+
+    txt = (
+        "📊 **تنظیمات نمایش داشبورد**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "می‌خواهید لیست سرورها بر چه اساسی مرتب شود؟"
+    )
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.dashboard_sort_kb(current_sort)
+
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+
+async def set_dashboard_sort_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ذخیره انتخاب کاربر و بازگشت به داشبورد"""
+    query = update.callback_query
+    sort_type = query.data.split('_')[3]  # uptime, traffic, etc.
+
+    context.user_data['dash_sort'] = sort_type
+
+    # ترجمه فارسی برای پیام تایید
+    names = {'uptime': 'آپتایم', 'traffic': 'ترافیک', 'resource': 'منابع', 'id': 'زمان ثبت'}
+    await query.answer(f"✅ مرتب‌سازی بر اساس {names.get(sort_type)} تنظیم شد.")
+
+    # مستقیم برمی‌گردیم به داشبورد با تنظیمات جدید
+    await status_dashboard(update, context)
+# ==============================================================================
+# 🎯 ADMIN REPORTS (ADVANCED)
+# ==============================================================================
+
+# State for User ID Input
+ADMIN_GET_UID_FOR_REPORT = range(300)
+async def admin_server_detail_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش حرفه‌ای جزئیات سرور (استفاده مجدد از server_detail)"""
+    sid = update.callback_query.data.split('_')[2]
+    # از تابع موجود server_detail استفاده می‌شود
+    await server_detail(update, context, custom_sid=sid)
+# ==============================================================================
+# 📡 TUNNEL MONITORING ADMIN FLOW (REWRITTEN & ADVANCED)
+# ==============================================================================
+
+async def monitor_settings_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پنل مدیریت سرور مانیتورینگ (هوشمند)"""
+    uid = update.effective_user.id
+    if uid != SUPER_ADMIN_ID: return
+    
+    if update.callback_query:
+        try: await update.callback_query.answer()
+        except: pass
+
+    # بررسی اینکه آیا سرور مانیتورینگ وجود دارد یا خیر
+    with db.get_connection() as (conn, cur):
+        monitor = cur.execute("SELECT * FROM servers WHERE is_monitor_node=1").fetchone()
+
+    # استفاده از ماژول کیبورد
+    is_set = monitor is not None
+    reply_markup = keyboard.monitor_node_kb(is_set)
+
+    if not monitor:
+        # --- حالت اول: هنوز سرور ست نشده ---
+        desc = (
+            "📡 **سیستم مانیتورینگ تانل (Iran Node)**\n"
+            "➖➖➖➖➖➖➖➖➖➖\n"
+            "در این سیستم، یک سرور ایران وظیفه تست مداوم کانفیگ‌های شما را بر عهده می‌گیرد.\n\n"
+            "⚠️ **وضعیت فعلی:** هنوز سرور ایران ست نشده است.\n\n"
+            "✅ با کلیک بر روی دکمه زیر، مراحل نصب خودکار آغاز می‌شود:"
+        )
+    else:
+        # --- حالت دوم: سرور فعال است ---
+        ip_censored = monitor['ip'] # نمایش آی‌پی
+        desc = (
+            "📡 **سیستم مانیتورینگ تانل (Iran Node)**\n"
+            "➖➖➖➖➖➖➖➖➖➖\n"
+            f"✅ **وضعیت:** فعال و متصل\n"
+            f"🖥 **نام سرور:** `{monitor['name']}`\n"
+            f"🌐 **آی‌پی:** `{ip_censored}`\n\n"
+            "📂 **مدیریت فایل‌ها و ارتباط:**"
+        )
+
+    await safe_edit_message(update, desc, reply_markup=reply_markup)
+
+
+# --- استیت‌های دریافت مشخصات سرور ایران ---
+async def set_iran_monitor_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "📝 **یک نام برای سرور ایران انتخاب کنید:**\n(مثلاً: Iran-MCI)", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_NAME
+
+async def get_iran_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_name'] = update.message.text
+    await update.message.reply_text("🇮🇷 **آی‌پی سرور ایران را وارد کنید:**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_IP
+
+async def get_iran_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_ip'] = update.message.text
+    await update.message.reply_text("🔌 **پورت اتصال SSH را وارد کنید (پیش‌فرض 22):**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_PORT
+
+async def get_iran_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        port = int(update.message.text)
+        context.user_data['iran_port'] = port
+        await update.message.reply_text("👤 **نام کاربری (Username) سرور ایران:**\n(معمولاً root)", reply_markup=keyboard.get_cancel_markup())
+        return GET_IRAN_USER
+    except:
+        await update.message.reply_text("❌ لطفاً عدد وارد کنید.")
+        return GET_IRAN_PORT
+
+async def get_iran_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['iran_user'] = update.message.text
+    await update.message.reply_text("🔑 **رمز عبور (Password) سرور ایران:**", reply_markup=keyboard.get_cancel_markup())
+    return GET_IRAN_PASS
+
+async def get_iran_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text
+    
+    # اطلاعات جمع آوری شده
+    name = context.user_data.get('iran_name')
+    ip = context.user_data.get('iran_ip')
+    port = context.user_data.get('iran_port')
+    user = context.user_data.get('iran_user')
+
+    if not name or not ip:
+        await update.message.reply_text("⚠️ اطلاعات ناقص است. مجدد تلاش کنید.")
+        return ConversationHandler.END
+
+    # پیام اولیه (شروع عملیات)
+    progress_msg = await update.message.reply_text(
+        "🚀 **آغاز عملیات نصب و راه‌اندازی...**\n"
+        "⏳ در حال برقراری ارتباط با سرور ایران..."
+    )
+
+    loop = asyncio.get_running_loop()
+
+    # --- تابع داخلی برای اجرای مراحل نصب ---
+    def install_process_sync():
+        log_steps = []
+        client = None
+        try:
+            # 1. اتصال
+            client = ServerMonitor.get_ssh_client(ip, port, user, password)
+            log_steps.append("✅ اتصال SSH برقرار شد.")
+            
+            # 2. آماده‌سازی محیط لاگ
+            # ساخت فایل لاگ و دادن دسترسی کامل برای ثبت ریزترین خطاها
+            log_setup_cmd = "touch /root/agent_debug.log && chmod 777 /root/agent_debug.log && echo '--- LOG STARTED ---' > /root/agent_debug.log"
+            client.exec_command(log_setup_cmd)
+            log_steps.append("📝 فایل لاگ دیباگ ساخته شد.")
+
+            # 3. آپلود فایل ایجنت
+            sftp = client.open_sftp()
+            try:
+                sftp.mkdir("/root/xray_workspace")
+            except: pass # اگر پوشه بود خطا نده
+            
+            with sftp.file("/root/monitor_agent.py", "w") as remote_file:
+                remote_file.write(get_agent_content())
+            sftp.close()
+            log_steps.append("📂 فایل مانیتورینگ منتقل شد.")
+
+            # 4. نصب پیش‌نیازها و Xray (این مرحله زمان‌بر است)
+            log_steps.append("📦 در حال نصب پکیج‌ها (Python, Curl, Unzip)...")
+            
+            # دستور نصب (بدون پرسش)
+            setup_cmd = (
+                "export DEBIAN_FRONTEND=noninteractive; "
+                "apt-get update -y > /dev/null 2>&1 && "
+                "apt-get install -y python3 python3-requests curl unzip > /dev/null 2>&1 && " # 👈 python3-requests اضافه شد
+                "chmod +x /root/monitor_agent.py"
+            )
+            
+            # اجرا با timeout بالا چون آپدیت مخازن ایران کند است
+            stdin, stdout, stderr = client.exec_command(setup_cmd, timeout=300)
+            exit_status = stdout.channel.recv_exit_status()
+            
+            if exit_status != 0:
+                err = stderr.read().decode()
+                raise Exception(f"خطا در نصب پکیج‌ها: {err}")
+            
+            log_steps.append("✅ نصب پکیج‌ها با موفقیت انجام شد.")
+            client.close()
+            return True, log_steps
+
+        except Exception as e:
+            if client: client.close()
+            return False, str(e)
+
+    # --- اجرای مرحله به مرحله در ترد جداگانه (چون SSH بلاک‌کننده است) ---
+    # اما چون می‌خواهیم پیام آپدیت شود، کمی تریک می‌زنیم یا کل فانکشن را یکجا اجرا می‌کنیم
+    # برای سادگی و جلوگیری از هنگ کردن بات، کل پروسه را در executor می‌بریم
+    # و فقط نتیجه نهایی را چک می‌کنیم (یا می‌توانیم لاجیک پیچیده‌تر برای استریم داشته باشیم)
+    # اینجا برای تجربه کاربری بهتر، پیام را چند بار فیک آپدیت می‌کنیم تا حس انجام کار بدهد
+    
+    # تسک واقعی در پس‌زمینه
+    task = loop.run_in_executor(None, install_process_sync)
+    
+    # حلقه نمایش وضعیت فیک (چون دسترسی به لاگ لحظه‌ای ترد سخت است)
+    steps_visual = [
+        "📂 در حال انتقال فایل‌های سیستمی...",
+        "📝 در حال تنظیم سیستم لاگ‌برداری دقیق...",
+        "📦 در حال نصب Xray Core و وابستگی‌ها...",
+        "☕️ لطفاً صبر کنید (سرورهای ایران کند هستند)...",
+        "⚙️ در حال پیکربندی نهایی..."
+    ]
+    
+    for step in steps_visual:
+        if task.done(): break
+        try:
+            await progress_msg.edit_text(f"🚀 **نصب خودکار روی سرور ایران**\n\n{step}\n⏳ لطفاً صبر کنید...")
+        except: pass
+        await asyncio.sleep(4) # هر ۴ ثانیه پیام عوض شود
+
+    # انتظار برای پایان واقعی کار
+    success, result = await task
+    
+    if success:
+        # ثبت در دیتابیس
+        real_name = f"🇮🇷 {name}"
+        encrypted_pass = sec.encrypt(password)
+        
+        try:
+            with db.get_connection() as (conn, cur):
+                # غیرفعال کردن مانیتورهای قبلی
+                cur.execute("UPDATE servers SET is_monitor_node = 0")
+                
+                # حذف اگر قبلاً با این نام بوده
+                cur.execute("DELETE FROM servers WHERE owner_id = ? AND name = ?", (SUPER_ADMIN_ID, real_name))
+                
+                # ایجاد جدید
+                cur.execute('''
+                    INSERT INTO servers (owner_id, name, ip, port, username, password, is_monitor_node, is_active, location_type, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, 1, 'ir', datetime('now'))
+                ''', (SUPER_ADMIN_ID, real_name, ip, port, user, encrypted_pass))
+                conn.commit()
+
+            await progress_msg.edit_text(
+                f"✅ **عملیات با موفقیت تکمیل شد!**\n\n"
+                f"🔹 فایل مانیتورینگ نصب شد.\n"
+                f"🔹 فایل لاگ `agent_debug.log` ساخته شد.\n"
+                f"🔹 سرور به عنوان نود مانیتورینگ فعال گردید.\n\n"
+                f"از این پس تست کانفیگ‌ها از طریق این سرور انجام می‌شود."
+            )
+            # بازگشت به پنل مانیتورینگ برای دیدن گزینه‌های جدید
+            await asyncio.sleep(3)
+            await monitor_settings_panel(update, context)
+
+        except Exception as e:
+            await progress_msg.edit_text(f"❌ خطا در ذخیره دیتابیس:\n{e}")
+    else:
+        # نمایش خطا
+        await progress_msg.edit_text(f"❌ **عملیات شکست خورد!**\n\nخطا: `{result}`")
+
+    return ConversationHandler.END
+
+
+async def delete_monitor_node(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف فایل‌ها از سرور ایران و قطع ارتباط"""
+    query = update.callback_query
+    await query.answer("🗑 در حال حذف فایل‌ها و قطع ارتباط...", show_alert=True)
+    msg = await query.message.reply_text("⏳ **در حال پاکسازی سرور ایران...**")
+
+    with db.get_connection() as (conn, cur):
+        monitor = cur.execute("SELECT * FROM servers WHERE is_monitor_node=1").fetchone()
+
+    if not monitor:
+        await msg.edit_text("❌ سروری یافت نشد.")
+        return
+
+    # دستورات پاکسازی
+    cleanup_cmd = "rm -rf /root/monitor_agent.py /root/agent_debug.log /root/xray_workspace"
+    
+    loop = asyncio.get_running_loop()
+    try:
+        # تلاش برای وصل شدن و پاک کردن فایل‌ها
+        await loop.run_in_executor(
+            None, ServerMonitor.run_remote_command, 
+            monitor['ip'], monitor['port'], monitor['username'], sec.decrypt(monitor['password']),
+            cleanup_cmd, 20
+        )
+        server_cleaned = True
+    except:
+        server_cleaned = False # شاید سرور خاموشه، ولی از دیتابیس پاک میکنیم
+
+    # حذف از دیتابیس (یا فقط برداشتن فلگ مانیتور)
+    db.delete_server(monitor['id'], SUPER_ADMIN_ID)
+
+    text = "✅ **ارتباط قطع شد.**\n"
+    text += "🔹 سرور از لیست ربات حذف شد.\n"
+    if server_cleaned:
+        text += "🔹 فایل‌های مانیتورینگ و لاگ‌ها از سرور ایران پاک شدند."
+    else:
+        text += "⚠️ نکته: نتوانستیم به سرور وصل شویم تا فایل‌ها را پاک کنیم (احتمالاً سرور خاموش است)."
+
+    await msg.edit_text(text)
+    await asyncio.sleep(2)
+    await monitor_settings_panel(update, context)
+async def update_monitor_node(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بررسی بروزرسانی و ریپلیس کردن فایل‌ها"""
+    query = update.callback_query
+    await query.answer("🔄 در حال بررسی و آپدیت فایل‌ها...", show_alert=True)
+    msg = await query.message.reply_text("⏳ **در حال بروزرسانی فایل‌های سرور ایران...**")
+
+    with db.get_connection() as (conn, cur):
+        monitor = cur.execute("SELECT * FROM servers WHERE is_monitor_node=1").fetchone()
+
+    if not monitor:
+        await msg.edit_text("❌ سرور مانیتورینگ یافت نشد.")
+        return
+
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+
+    loop = asyncio.get_running_loop()
+
+    def update_process():
+        try:
+            client = ServerMonitor.get_ssh_client(ip, port, user, password)
+            sftp = client.open_sftp()
+            
+            # آپلود مجدد فایل ایجنت (جایگزینی)
+            with sftp.file("/root/monitor_agent.py", "w") as remote_file:
+                remote_file.write(get_agent_content())
+            sftp.close()
+            
+            # اطمینان از وجود فایل لاگ و دسترسی‌ها
+            cmds = (
+                "chmod +x /root/monitor_agent.py && "
+                "touch /root/agent_debug.log && "
+                "chmod 777 /root/agent_debug.log && "
+                "echo '--- UPDATED AT $(date) ---' >> /root/agent_debug.log"
+            )
+            client.exec_command(cmds)
+            client.close()
+            return True, "Success"
+        except Exception as e:
+            return False, str(e)
+
+    success, result = await loop.run_in_executor(None, update_process)
+
+    if success:
+        await msg.edit_text(
+            "✅ **بروزرسانی موفقیت‌آمیز بود.**\n\n"
+            "🔹 فایل `monitor_agent.py` جایگزین شد.\n"
+            "🔹 دسترسی فایل لاگ بررسی شد.\n"
+            "🔹 سیستم آماده کار است."
+        )
+    else:
+        await msg.edit_text(f"❌ **خطا در بروزرسانی:**\n`{result}`")
+
+# ==============================================================================
+# 🎮 UI HELPERS & GENERAL HANDLERS
+# ==============================================================================
+# get_cancel_markup حذف شد چون در ماژول کیبورد وجود دارد
+
+async def safe_edit_message(update: Update, text, reply_markup=None, parse_mode='Markdown'):
+    try:
+        if update.callback_query:
+            # اگر متن و کیبورد تغییر نکرده باشد، تلگرام ارور میدهد. اینجا هندل میکنیم
+            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        elif update.message:
+            await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        # اگر ارور این بود که "پیام تغییر نکرده"، نادیده بگیر
+        if "Message is not modified" in str(e):
+            return
+        logger.error(f"Edit Error: {e}")
+    except Exception as e:
+        logger.error(f"General Edit Error: {e}")
+
+
+async def cancel_handler_func(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except:
+            pass
+    await safe_edit_message(update, "🚫 **عملیات لغو شد.**")
+    await asyncio.sleep(1)
+    await start(update, context)
+    return ConversationHandler.END
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ارسال لاگ خطا به ادمین در تلگرام"""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    
+    # ساخت متن کامل خطا
+    tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+    tb_string = "".join(tb_list)
+    
+    # پیام خطا برای ارسال به ادمین
+    message = (
+        f"🚨 **CRITICAL ERROR** 🚨\n\n"
+        f"Update: <pre>{html.escape(str(update))}</pre>\n\n"
+        f"❌ Error:\n<pre>{html.escape(tb_string[-3500:])}</pre>"
+    )
+    
+    # چاپ در کنسول برای اطمینان
+    print(tb_string)
+
+    # ارسال به تلگرام ادمین
+    try:
+        if SUPER_ADMIN_ID:
+            await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=message, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Failed to send error log to admin: {e}")
+async def run_background_ssh_task(context: ContextTypes.DEFAULT_TYPE, chat_id, func, *args):
+    loop = asyncio.get_running_loop()
+    try:
+        ok, output = await loop.run_in_executor(None, func, *args)
+        clean_out = html.escape(str(output))
+        if len(clean_out) > 3500:
+            clean_out = clean_out[:3500] + "\n... (Output Truncated)"
+
+        status_icon = "✅ عملیات با موفقیت انجام شد." if ok else "❌ عملیات با خطا مواجه شد."
+        msg_text = (
+            f"{status_icon}\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"<pre>{clean_out}</pre>"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='HTML')
+
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ خطای غیرمنتظره در عملیات پس‌زمینه:\n{e}")
+
+# ==============================================================================
+# 📝 CONFIG MANAGEMENT (NEW GRAPHICAL MENU)
+# ==============================================================================
+
+async def add_config_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع پروسه افزودن کانفیگ - دریافت لینک"""
+    if update.callback_query:
+        await update.callback_query.answer()
+        
+    txt = (
+        "📥 **افزودن کانفیگ جدید**\n\n"
+        "لطفاً لینک خود را ارسال کنید (پشتیبانی از تمام پروتکل‌ها).\n"
+        "ما خودمان نوع آن را تشخیص می‌دهیم یا از شما می‌پرسیم.\n\n"
+        "👇 لینک (vmess/vless/http...) را ارسال کنید:"
+    )
+    
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
+    return GET_CONFIG_LINKS
+
+# --- هندلرهای انتخاب مود ---
+async def mode_ask_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    txt = (
+        "📄 **لطفاً کانفیگ JSON خود را ارسال کنید.**\n\n"
+        "می‌توانید:\n"
+        "1️⃣ متن JSON را همینجا پیست کنید.\n"
+        "2️⃣ فایل `.json` را آپلود کنید.\n\n"
+        "⚠️ ساختار باید استاندارد Xray Outbound باشد."
+    )
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
+    return GET_JSON_CONF
+
+
+async def mode_ask_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    txt = (
+        "🔗 **لطفاً لینک سابسکریپشن را ارسال کنید.**\n\n"
+        "فرمت مثال:\n"
+        "`https://example.com/sub/xyz...`"
+    )
+    await safe_edit_message(update, txt, reply_markup=keyboard.get_cancel_markup())
+    return GET_SUB_LINK
+
+
+# --- پردازش فایل/متن JSON ---
+async def process_json_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    config_content = ""
+
+    # 1. دریافت محتوا (متن یا فایل)
+    if update.message.document:
+        f = await update.message.document.get_file()
+        byte_arr = await f.download_as_bytearray()
+        config_content = byte_arr.decode('utf-8')
+    elif update.message.text:
+        config_content = update.message.text
+    else:
+        await update.message.reply_text("❌ لطفاً فقط متن یا فایل ارسال کنید.")
+        return GET_JSON_CONF
+
+    # 2. اعتبارسنجی JSON
+    try:
+        data = json.loads(config_content)
+        # اگر جیسون معتبر بود، اسمش را از تگ برمی‌داریم
+        name = data.get('tag', f"JSON_{int(time.time())}")
+
+        # ذخیره در دیتابیس (کانفیگ را مینیفای می‌کنیم تا در یک خط جا شود)
+        minified_json = json.dumps(data)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        with db.get_connection() as (conn, cur):
+            cur.execute(
+                "INSERT INTO tunnel_configs (owner_id, type, link, name, added_at) VALUES (?, 'json', ?, ?, ?)",
+                (uid, minified_json, name, now)
+            )
+            conn.commit()
+
+        await update.message.reply_text(f"✅ **کانفیگ JSON با موفقیت ثبت شد.**\n🏷 نام: `{name}`")
+        await asyncio.sleep(1)
+        await start(update, context)
+        return ConversationHandler.END
+
+    except json.JSONDecodeError:
+        await update.message.reply_text("❌ **فرمت JSON نامعتبر است!**\nلطفاً کدهای ارسالی را چک کنید.")
+        return GET_JSON_CONF
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطای ناشناخته: {e}")
+        return ConversationHandler.END
+
+async def process_sub_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    link = update.message.text.strip()
+    uid = update.effective_user.id
+
+    if not link.startswith(('http://', 'https://')):
+        await update.message.reply_text("❌ لینک باید با http یا https شروع شود.")
+        return GET_SUB_LINK
+
+    msg = await update.message.reply_text("⏳ **در حال دریافت و آنالیز کانفیگ‌ها...**")
+
+    # دریافت اطلاعات سرور ایران
+    with db.get_connection() as (conn, cur):
+        monitor = cur.execute("SELECT * FROM servers WHERE is_monitor_node=1").fetchone()
+
+    if not monitor:
+        await msg.edit_text("❌ سرور مانیتورینگ فعال نیست.")
+        return ConversationHandler.END
+
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+    cmd = f"python3 /root/monitor_agent.py {shlex.quote(link)}"
+
+    loop = asyncio.get_running_loop()
+    # افزایش تایم‌اوت به 30 ثانیه برای ساب‌های سنگین
+    ok, output = await loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 30)
+
+    try:
+        data = None
+        for line in output.split('\n'):
+            line = line.strip()
+            if not line: continue
+            try:
+                temp = json.loads(line)
+                if temp.get('type') == 'sub':
+                    data = temp
+                    break
+            except:
+                pass
+        if not data:
+            data = extract_safe_json(output)
+
+        if not data:
+             raise Exception("Invalid Agent Output (No JSON found)")
+        
+        if data.get('type') == 'sub':
+            configs = data.get('configs', [])
+            count = len(configs)
+
+            if count == 0:
+                await msg.edit_text("❌ کانفیگی یافت نشد.")
+                return ConversationHandler.END
+            
+            # نام‌گذاری ساب
+            sub_name = f"Sub_{int(time.time())}"
+            if "remarks" in link:
+                 try: sub_name = urllib.parse.parse_qs(urllib.parse.urlparse(link).query).get('remarks', [sub_name])[0]
+                 except: pass
+
+            await msg.edit_text(f"✅ **{count} کانفیگ شناسایی شد.**\n⬇️ در حال ثبت در دیتابیس...")
+            
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            with db.get_connection() as (conn, cur):
+                for i, cfg in enumerate(configs):
+                    # دریافت نام و لینک از دیکشنری جدید
+                    real_name = cfg.get('name', 'Unknown')
+                    conf_link = cfg.get('link')
+                    
+                    # اگر نام نداشت، یک نام پیش‌فرض بساز
+                    if real_name == "Unknown" or not real_name:
+                        real_name = f"{sub_name}_{i + 1}"
+                    
+                    # تمیزکاری نام
+                    real_name = urllib.parse.unquote(real_name).replace('+', ' ').strip()
+
+                    cur.execute(
+                        "INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score) VALUES (?, 'sub_item', ?, ?, ?, 10)",
+                        (uid, conf_link, real_name, now)
+                    )
+                conn.commit()
+
+            await msg.edit_text(
+                f"✅ **عملیات موفق!**\n"
+                f"📂 نام مجموعه: `{sub_name}`\n"
+                f"🔢 تعداد ثبت شده: `{count}` کانفیگ"
+            )
+            await asyncio.sleep(2)
+            await start(update, context)
+            return ConversationHandler.END
+
+    except Exception as e:
+        await msg.edit_text(f"❌ خطا در پردازش: {e}")
+        return ConversationHandler.END
+
+# ==============================================================================
+# 🚇 TUNNEL CONFIG MANAGER (ADVANCED)
+# ==============================================================================
+async def tunnel_list_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی انتخاب نوع لیست کانفیگ (نسخه اصلاح شده و ضد کرش)"""
+    logger.info("🟢 Entering tunnel_list_menu function...") # لاگ ورود
+    
+    try:
+        # --- بخش اصلاح شده برای جلوگیری از کرش ---
+        if update.callback_query:
+            try:
+                await update.callback_query.answer()
+                logger.debug("Callback answered successfully.")
+            except Exception as e:
+                # اگر دکمه منقضی شده بود، فقط در لاگ بنویس و رد شو (کرش نکن)
+                logger.warning(f"Callback answer ignored (Timeout/Old Query): {e}")
+        # -------------------------------------------
+        
+        txt = (
+            "📑 **مدیریت کانفیگ‌ها**\n\n"
+            "لطفاً نوع نمایش را انتخاب کنید:"
+        )
+        
+        logger.debug("Generating Keyboard from keyboard.py...")
+        # ساخت کیبورد
+        reply_markup = keyboard.tunnel_list_mode_kb()
+        logger.debug(f"Keyboard Generated: {reply_markup}")
+
+        logger.debug("Sending message to user...")
+        await safe_edit_message(update, txt, reply_markup=reply_markup)
+        logger.info("✅ tunnel_list_menu finished successfully.")
+
+    except Exception as e:
+        # اگر خطای دیگری رخ داد، لاگ بگیر و به کاربر بگو
+        logger.error(f"❌ CRITICAL ERROR in tunnel_list_menu: {e}")
+        logger.error(traceback.format_exc()) # چاپ ریز مکالمات خطا
+        
+        if update.callback_query:
+            try:
+                await update.callback_query.message.reply_text("❌ خطایی در نمایش منو رخ داد. لطفاً دوباره تلاش کنید.")
+            except: pass
+
+    except Exception as e:
+        # اگر هر خطایی رخ بده اینجا چاپ میشه
+        logger.error(f"❌ ERROR in tunnel_list_menu: {e}")
+        logger.error(traceback.format_exc()) # چاپ ریز مکالمات خطا
+        
+        # یه پیام هم به کاربر نشون میدیم که بفهمه خراب شده
+        if update.callback_query:
+            await update.callback_query.message.reply_text(f"❌ خطا در بخش مدیریت کانفیگ:\n{e}")
+async def perform_fast_scan(context, uid, mode):
+    """تست سریع کانفیگ‌ها قبل از نمایش لیست"""
+    # تعیین نوع کانفیگ برای اسکن
+    query_filter = "AND type != 'sub_source'" # پیش‌فرض برای همه
+    if mode == 'single':
+        query_filter = "AND type='single'"
+    elif mode == 'sub':
+        # در حالت ساب معمولا لیست فولدرها باز میشه، اما اگر بخواهیم آیتم‌ها رو چک کنیم:
+        query_filter = "AND type='sub_item'"
+
+    # گرفتن کانفیگ‌های کاربر
+    with db.get_connection() as (conn, cur):
+        monitor = cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1").fetchone()
+        # فقط ۵۰ کانفیگ آخر را برای سرعت بیشتر چک می‌کنیم (یا همه را بسته به نیاز)
+        configs = cur.execute(f"SELECT * FROM tunnel_configs WHERE owner_id=? {query_filter} ORDER BY id DESC LIMIT 30", (uid,)).fetchall()
+
+    if not monitor or not configs:
+        return # چیزی برای تست نیست
+
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+    loop = asyncio.get_running_loop()
+
+    # پردازش دسته‌ای (Batch Processing)
+    chunk_size = 5
+    tasks = []
+    
+    for cfg in configs:
+        # آماده‌سازی دستور
+        link_arg = cfg['link']
+        if cfg['type'] == 'json' or link_arg.strip().startswith('{'):
+            safe_link = link_arg.replace('"', '\\"')
+            # تست سبک (1 مگابایت) برای سرعت بالا در لیست
+            cmd = f'python3 /root/monitor_agent.py "{safe_link}" 1.0'
+        else:
+            cmd = f"python3 /root/monitor_agent.py '{link_arg}' 1.0"
+            
+        # تایم‌اوت کوتاه (۱۵ ثانیه) برای عدم معطلی کاربر
+        tasks.append(loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 15))
+
+    # اجرای همزمان همه تست‌ها
+    results = await asyncio.gather(*tasks)
+
+    # آپدیت دیتابیس
+    with db.get_connection() as (conn, cur):
+        for idx, (ok, output) in enumerate(results):
+            cid = configs[idx]['id']
+            try:
+                if ok:
+                    import re
+                    json_match = re.search(r'(\{.*\})', output.strip(), re.DOTALL)
+                    if json_match:
+                        res = json.loads(json_match.group(1))
+                        if res.get("status") == "OK":
+                            ping = res.get('ping', 0)
+                            score = res.get('score', 0)
+                            cur.execute(
+                                "UPDATE tunnel_configs SET last_status='OK', last_ping=?, quality_score=? WHERE id=?",
+                                (ping, score, cid)
+                            )
+                        else:
+                            cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=?", (cid,))
+            except:
+                pass # اگر خطا داد، وضعیت قبلی بماند یا Fail شود
+        conn.commit()
+
+# تابع جدید برای نمایش لیست بر اساس مود انتخاب شده
+async def show_tunnels_by_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, custom_data=None):
+    query = update.callback_query
+    target_data = custom_data if custom_data else query.data
+    data_parts = target_data.split('_')
+    mode = data_parts[2] # single, sub, all
+    uid = update.effective_user.id
+    
+    # لاجیک صفحه بندی
+    page = 1
+    if len(data_parts) > 3:
+        try: page = int(data_parts[3])
+        except: page = 1
+
+    delete_mode = False
+    if len(data_parts) > 4:
+        if data_parts[4] == '1':
+            delete_mode = True
+    if mode == 'sub':
+        with db.get_connection() as (conn, cur):
+            subs = cur.execute("SELECT * FROM tunnel_configs WHERE owner_id=? AND type='sub_source'", (uid,)).fetchall()
+            
+        if not subs:
+            await safe_edit_message(update, "❌ هیچ اشتراکی (Subscription) ثبت نکرده‌اید.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='tunnel_list_menu')]]))
+            return
+
+        txt = "📦 **لیست اشتراک‌های شما**\nبرای مدیریت یا آپدیت روی نام اشتراک بزنید:"
+        # استفاده از ماژول کیبورد
+        reply_markup = keyboard.sub_list_kb(subs)
+        
+        await safe_edit_message(update, txt, reply_markup=reply_markup)
+        return
+
+    # --- تنظیمات کوئری برای حالت Single و All ---
+    LIMIT = 10
+    offset = (page - 1) * LIMIT
+    
+    base_query = "SELECT * FROM tunnel_configs WHERE owner_id=? AND type != 'sub_source'"
+    count_query = "SELECT COUNT(*) FROM tunnel_configs WHERE owner_id=? AND type != 'sub_source'"
+    params = [uid]
+    
+    if mode == 'single':
+        base_query += " AND type='single'"
+        count_query += " AND type='single'"
+        title = "👤 **لیست کانفیگ‌های تکی**"
+    else:
+        title = "🔗 **همه کانفیگ‌ها**"
+
+    # مرتب‌سازی بر اساس آخرین وضعیت (فعال‌ها بالا باشند)
+    base_query += f" ORDER BY last_status DESC, id DESC LIMIT {LIMIT} OFFSET {offset}"
+    
+    with db.get_connection() as (conn, cur):
+        total_count = cur.execute(count_query, params).fetchone()[0]
+        configs = cur.execute(base_query, params).fetchall()
+
+    if total_count == 0:
+        await safe_edit_message(update, f"❌ موردی یافت نشد.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='tunnel_list_menu')]]))
+        return
+
+    total_pages = (total_count + LIMIT - 1) // LIMIT
+    
+    now_time = datetime.now().strftime("%H:%M:%S")
+
+    # --- تعیین متن پیام (وابسته به حالت حذف) ---
+    if delete_mode:
+        txt = (
+            f"🗑 **حالت حذف فعال است**\n"
+            f"⚠️ روی هر کانفیگ بزنید تا **حذف** شود:\n"
+            f"📄 صفحه {page} از {total_pages}\n"
+            f"➖➖➖➖➖➖➖➖➖➖"
+        )
+    else:
+        txt = f"{title}\n🕒 آخرین تست: `{now_time}`\n📄 صفحه {page} از {total_pages}\n➖➖➖➖➖➖➖➖➖➖"
+    
+    # استفاده از ماژول کیبورد (با پارامتر جدید delete_mode)
+    reply_markup = keyboard.tunnel_list_kb(configs, page, total_pages, mode, delete_mode=delete_mode)
+    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+# --- منوی مدیریت اشتراک ---
+# --- منوی مدیریت اشتراک ---
+async def manage_single_sub_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی مدیریت اشتراک (نسخه HTML ضد کرش)"""
+    query = update.callback_query
+    data_parts = query.data.split('_')
+    sub_id = int(data_parts[2])
+    
+    page = 1
+    if len(data_parts) > 3 and data_parts[3].isdigit():
+        page = int(data_parts[3])
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (sub_id,))
+        sub = cur.fetchone()
+        if not sub:
+            await query.answer("❌ اشتراک یافت نشد.", show_alert=True)
+            return
+        cur.execute("SELECT id, name, last_status, last_ping FROM tunnel_configs WHERE name LIKE %s AND type='sub_item'", (f"{sub['name']}%",))
+        items = cur.fetchall()
+
+    # ✅ ایمن‌سازی نام برای HTML
+    safe_sub_name = html.escape(sub['name'])
+
+    stats_txt = ""
+    try:
+        if sub['sub_info'] and sub['sub_info'] != '{}':
+            info = json.loads(sub['sub_info'])
+            total = info.get('total', 0)
+            used = info.get('upload', 0) + info.get('download', 0)
+            expire_ts = info.get('expire', 0)
+            
+            percent = (used / total * 100) if total > 0 else 0
+            bar = ServerMonitor.make_bar(percent, 10)
+            
+            if expire_ts:
+                exp_date = datetime.fromtimestamp(expire_ts)
+                days_left = (exp_date - datetime.now()).days
+                exp_str = f"{days_left} روز"
+            else:
+                exp_str = "نامحدود"
+
+            stats_txt = (
+                f"📊 <b>وضعیت مصرف:</b>\n"
+                f"💾 <code>{bar}</code> {percent:.1f}%\n"
+                f"📉 مصرفی: <code>{format_bytes(used)}</code>\n"
+                f"📦 کل حجم: <code>{format_bytes(total)}</code>\n"
+                f"⏳ انقضا: <code>{exp_str}</code>\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+            )
+    except: pass
+
+    per_page = 8
+    total_items = len(items)
+    max_pages = (total_items + per_page - 1) // per_page
+    start_idx = (page - 1) * per_page
+    current_items = items[start_idx:start_idx + per_page]
+    active_count = sum(1 for i in items if i['last_status'] == 'OK')
+    
+    txt = (
+        f"📂 <b>مدیریت اشتراک: {safe_sub_name}</b>\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"{stats_txt}"
+        f"🔢 تعداد کانفیگ: <code>{total_items}</code>\n"
+        f"✅ کانفیگ‌های سالم: <code>{active_count}</code>\n\n"
+        f"👇 <b>برای مشاهده جزئیات روی کانفیگ بزنید:</b>"
+    )
+
+    reply_markup = keyboard.manage_sub_kb(current_items, sub_id, page, max_pages, sub['name'])
+    
+    # استفاده از HTML برای جلوگیری از خطا
+    await safe_edit_message(update, txt, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def get_sub_links_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال تمام لینک‌های یک سابسکریپشن برای کاربر به صورت فایل"""
+    query = update.callback_query
+    sub_id = int(query.data.split('_')[3])
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s", (sub_id,))
+        sub = cur.fetchone()
+        if not sub:
+            await query.answer("❌ اشتراک یافت نشد.", show_alert=True)
+            return
+            
+        cur.execute("SELECT link, name FROM tunnel_configs WHERE name LIKE %s AND type='sub_item'", (f"{sub['name']}%",))
+        items = cur.fetchall()
+        
+    if not items:
+        await query.answer("⚠️ هیچ کانفیگی در این اشتراک وجود ندارد.", show_alert=True)
+        return
+        
+    await query.answer("📤 در حال آماده‌سازی فایل...", show_alert=False)
+    
+    # ساخت محتوای فایل
+    file_content = ""
+    for item in items:
+        link = item['link']
+        # اگر نیاز به تغییر نام در لینک بود اینجا اضافه می‌شود
+        # فعلاً لینک خام را می‌گذاریم تا کلاینت‌ها درست کار کنند
+        file_content += f"{link}\n"
+
+    # ارسال فایل
+    f = io.BytesIO(file_content.encode('utf-8'))
+    f.name = f"{sub['name']}_configs.txt"
+    
+    try:
+        await query.message.reply_document(
+            document=f,
+            caption=f"📦 **کانفیگ‌های اشتراک: {sub['name']}**\n🔢 تعداد: {len(items)}"
+        )
+    except Exception as e:
+        await query.message.reply_text(f"❌ خطا در ارسال فایل: {e}")
+
+
+async def delete_full_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف سابسکریپشن و تمام کانفیگ‌های زیرمجموعه (اصلاح شده)"""
+    query = update.callback_query
+    sub_id = int(query.data.split('_')[3])
+    uid = update.effective_user.id
+    
+    # 1. حذف از دیتابیس
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT name FROM tunnel_configs WHERE id=%s", (sub_id,))
+        sub = cur.fetchone()
+        if sub:
+            # حذف سورس
+            cur.execute("DELETE FROM tunnel_configs WHERE id=%s", (sub_id,))
+            # حذف زیرمجموعه‌ها
+            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND name LIKE %s", (uid, f"{sub['name']}%"))
+            conn.commit()
+            
+    # 2. نمایش پیام موفقیت (داخل try برای جلوگیری از کرش)
+    try:
+        await query.answer("✅ اشتراک حذف شد.", show_alert=True)
+    except: pass
+    
+    # 3. رفرش لیست ساب‌ها (نکته مهم: استفاده از custom_data به جای تغییر query.data)
+    await show_tunnels_by_mode(update, context, custom_data="list_mode_sub")
+async def update_all_configs_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بروزرسانی وضعیت تمام کانفیگ‌ها به صورت یکجا"""
+    query = update.callback_query
+    uid = update.effective_user.id
+    
+    await query.answer("⏳ درخواست ارسال شد. نتیجه به تدریج بروز می‌شود.", show_alert=True)
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE owner_id=%s", (uid,))
+        configs = cur.fetchall()
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+        monitor = cur.fetchone()
+
+    if not monitor:
+        await query.message.reply_text("❌ سرور مانیتورینگ فعال نیست.")
+        return
+
+    # اجرا در پس‌زمینه بدون معطل کردن کاربر
+    asyncio.create_task(background_update_all(context, uid, configs, monitor))
+    
+    # بازگشت موقت به لیست
+    await tunnel_list_menu(update, context)
+
+
+async def background_update_all(context, uid, configs, monitor):
+    """تابع پس‌زمینه برای تست همه کانفیگ‌ها"""
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+    loop = asyncio.get_running_loop()
+
+    # پردازش دسته‌ای برای سرعت (مثلا ۳ تا همزمان)
+    chunk_size = 3
+    for i in range(0, len(configs), chunk_size):
+        chunk = configs[i:i+chunk_size]
+        tasks = []
+        
+        for cfg in chunk:
+            cmd = f"python3 /root/monitor_agent.py '{cfg['link']}'"
+            if cfg['type'] == 'json':
+                safe_json = cfg['link'].replace('"', '\\"')
+                cmd = f'python3 /root/monitor_agent.py "{safe_json}"'
+            
+            tasks.append(loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 25))
+        
+        results = await asyncio.gather(*tasks)
+        
+        # ثبت نتایج در دیتابیس
+        with db.get_connection() as (conn, cur):
+            for idx, (ok, output) in enumerate(results):
+                cid = chunk[idx]['id']
+                try:
+                    res = json.loads(output.strip())
+                    if res.get("status") == "OK":
+                        cur.execute(
+                            "UPDATE tunnel_configs SET last_status='OK', last_ping=%s, last_jitter=%s, quality_score=%s WHERE id=%s",
+                            (res.get('ping',0), res.get('jitter',0), 10, cid)
+                        )
+                    else:
+                        cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=%s", (cid,))
+                except:
+                    cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=%s", (cid,))
+            conn.commit()
+
+    # پیام اتمام
+    try:
+        await context.bot.send_message(chat_id=uid, text="✅ **وضعیت تمام کانفیگ‌ها بروزرسانی شد.**")
+    except: pass
+async def process_add_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دریافت لینک و تشخیص مسیر (پرسش نام برای ساب / خودکار برای تکی)"""
+    link = update.message.text.strip()
+    uid = update.effective_user.id
+    
+    # ذخیره لینک در حافظه موقت
+    context.user_data['temp_link'] = link
+
+    # --- حالت ۱: لینک سابسکریپشن (http/https) ---
+    if link.startswith(('http://', 'https://')):
+        context.user_data['temp_sub_link'] = link
+        
+        await update.message.reply_text(
+            "🔗 **لینک اشتراک تشخیص داده شد.**\n\n"
+            "📝 لطفاً یک **نام دلخواه** برای این اشتراک وارد کنید:\n"
+            "(مثلاً: همراه اول، رادار، ...)",
+            reply_markup=keyboard.get_cancel_markup()
+        )
+        # هدایت به مرحله دریافت نام
+        return GET_SUB_NAME
+    
+    # --- حالت ۲: کانفیگ تکی (vmess/vless/...) ---
+    elif link.startswith(('vless://', 'vmess://', 'trojan://', 'ss://')):
+        # ارسال مستقیم به پردازش خودکار (بدون پرسش نام)
+        return await handle_single_config_auto(update, context, link)
+
+    else:
+        await update.message.reply_text(
+            "❌ **فرمت لینک شناسایی نشد!**\n"
+            "لینک باید با `http` (ساب) یا `vless/vmess...` (تکی) شروع شود.",
+            reply_markup=keyboard.get_cancel_markup()
+        )
+        return GET_CONFIG_LINKS
+async def handle_config_type_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش نهایی بر اساس انتخاب کاربر (ساب یا تکی) - نسخه Non-Blocking"""
+    query = update.callback_query
+    choice = query.data
+    link = context.user_data.get('temp_link')
+    uid = update.effective_user.id
+    
+    await query.answer()
+    
+    # --- حالت ۱: سابسکریپشن ---
+    if choice == 'type_sub':
+        context.user_data['temp_sub_link'] = link
+        await safe_edit_message(update, 
+            "🔗 **حالت سابسکریپشن انتخاب شد.**\n\n"
+            "📝 لطفاً یک **نام دلخواه** برای این اشتراک وارد کنید (مثلاً: همراه اول):",
+            reply_markup=keyboard.get_cancel_markup()
+        )
+        return GET_SUB_NAME
+
+    # --- حالت ۲: کانفیگ تکی (تسک پس‌زمینه) ---
+    elif choice == 'type_single':
+        # پیام اولیه (بدون انتظار طولانی برای کاربر)
+        status_msg = await query.message.reply_text(
+            "⏳ **در حال ارسال به صف پردازش...**\n"
+            "ربات در پس‌زمینه کانفیگ را بررسی می‌کند.\n"
+            "(می‌توانید با /start عملیات را لغو کنید)"
+        )
+        
+        # تابع داخلی برای اجرای عملیات سنگین
+        async def heavy_config_check():
+            try:
+                loop = asyncio.get_running_loop()
+                
+                # 1. دریافت اطلاعات سرور مانیتورینگ
+                with db.get_connection() as (conn, cur):
+                    cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+                    monitor = cur.fetchone()
+                
+                if not monitor:
+                    await status_msg.edit_text("❌ سرور مانیتورینگ فعال نیست.")
+                    return
+
+                # آپدیت پیام وضعیت
+                await status_msg.edit_text("🚀 **در حال تست اتصال کانفیگ...**\nلطفاً چند لحظه صبر کنید.")
+
+                ip, port, user, password = monitor['ip'], monitor['port'], monitor['username'], sec.decrypt(monitor['password'])
+                
+                # دستور اجرا (با shlex برای امنیت)
+                safe_link = shlex.quote(link)
+                cmd = f"python3 /root/monitor_agent.py {safe_link}"
+                
+                # 2. اجرای دستور در ترد جداگانه (Non-Blocking)
+                ok, output = await loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 30)
+                
+                # 3. تحلیل خروجی
+                data = extract_safe_json(output)
+                
+                if ok and data:
+                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    if data.get('status') == 'OK' or data.get('extracted_name') or 'protocol' in data:
+                        # استخراج نام
+                        final_name = data.get('extracted_name', f"Config_{int(time.time())}")
+                        final_name = final_name.replace('+', ' ').strip()
+                        
+                        init_status = 'OK' if data.get('status') == 'OK' else 'Unknown'
+                        init_ping = data.get('ping', 0)
+                        score = data.get('score', 0)
+                        
+                        # ذخیره در دیتابیس
+                        with db.get_connection() as (conn, cur):
+                             cur.execute(
+                                 "INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score, last_status, last_ping) VALUES (%s, 'single', %s, %s, %s, %s, %s, %s)", 
+                                 (uid, link, final_name, now, score, init_status, init_ping)
+                             )
+                             conn.commit()
+                        
+                        dl_spd = data.get('down', '0')
+                        
+                        # پیام موفقیت نهایی
+                        await status_msg.edit_text(
+                            f"✅ **کانفیگ تکی ذخیره شد!**\n"
+                            f"🏷 نام: `{final_name}`\n"
+                            f"⭐️ امتیاز: `{score}/10`\n"
+                            f"🚀 سرعت دانلود: `{dl_spd} MB/s`"
+                        )
+                        await asyncio.sleep(2)
+                        
+                        # چون اینجا داخل ConversationHandler نیستیم (تسک جداست)، باید دستی منو را بفرستیم
+                        kb = [[InlineKeyboardButton("🔙 بازگشت به لیست کانفیگ‌ها", callback_data='tunnel_list_menu')]]
+                        await status_msg.reply_text("عملیات تکمیل شد.", reply_markup=InlineKeyboardMarkup(kb))
+                        return
+                
+                # اگر خطا بود
+                err_preview = output[:200] if output else "No Output"
+                await status_msg.edit_text(f"❌ خطا: فرمت کانفیگ شناسایی نشد.\n\n⚠️ خروجی سرور:\n`{err_preview}`")
+
+            except asyncio.CancelledError:
+                await status_msg.edit_text("🚫 عملیات توسط کاربر لغو شد.")
+                raise
+            except Exception as e:
+                await status_msg.edit_text(f"❌ خطای سیستم: {e}")
+            finally:
+                # حذف تسک از لیست فعال‌ها
+                if uid in USER_ACTIVE_TASKS:
+                    del USER_ACTIVE_TASKS[uid]
+
+        # ✅ ایجاد و ثبت تسک
+        task = asyncio.create_task(heavy_config_check())
+        USER_ACTIVE_TASKS[uid] = task
+        
+        # پایان استیت برای کاربر (تا بتواند کارهای دیگر انجام دهد)
+        return ConversationHandler.END
+async def handle_single_config_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, link):
+    """پردازش خودکار کانفیگ تکی بدون منو"""
+    uid = update.effective_user.id
+    
+    status_msg = await update.message.reply_text(
+        "⏳ **کانفیگ تکی تشخیص داده شد...**\n"
+        "🚀 در حال آنالیز، تبدیل به JSON و تست اتصال..."
+    )
+    
+    async def heavy_config_check():
+        try:
+            loop = asyncio.get_running_loop()
+            
+            with db.get_connection() as (conn, cur):
+                cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+                monitor = cur.fetchone()
+            
+            if not monitor:
+                await status_msg.edit_text("❌ سرور مانیتورینگ فعال نیست.")
+                return
+
+            ip, port, user, password = monitor['ip'], monitor['port'], monitor['username'], sec.decrypt(monitor['password'])
+            
+            # دستور اجرا (ایجنت خودش نام را از # استخراج می‌کند)
+            safe_link = shlex.quote(link)
+            cmd = f"python3 /root/monitor_agent.py {safe_link}"
+            
+            ok, output = await loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 30)
+            data = extract_safe_json(output)
+            
+            if ok and data and (data.get('status') == 'OK' or data.get('extracted_name')):
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                # دریافت نام استخراج شده توسط ایجنت
+                final_name = data.get('extracted_name')
+                if not final_name or final_name == "Single_Config":
+                     if '#' in link:
+                         try: final_name = urllib.parse.unquote(link.split('#')[-1]).strip()
+                         except: pass
+                
+                if not final_name: final_name = f"Config_{int(time.time())}"
+                final_name = final_name.replace('+', ' ').strip()
+
+                init_status = 'OK' if data.get('status') == 'OK' else 'Unknown'
+                score = data.get('score', 0)
+                
+                with db.get_connection() as (conn, cur):
+                     cur.execute(
+                         "INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score, last_status, last_ping) VALUES (?, 'single', ?, ?, ?, ?, ?, ?)", 
+                         (uid, link, final_name, now, score, init_status, data.get('ping', 0))
+                     )
+                     conn.commit()
+                
+                await status_msg.edit_text(
+                    f"✅ **کانفیگ تکی با موفقیت افزوده شد.**\n"
+                    f"🏷 نام: `{final_name}`\n"
+                    f"⭐️ کیفیت: `{score}/10`"
+                )
+                await asyncio.sleep(2)
+                
+                kb = [[InlineKeyboardButton("🔙 بازگشت به لیست", callback_data='tunnel_list_menu')]]
+                await status_msg.reply_text("عملیات تکمیل شد.", reply_markup=InlineKeyboardMarkup(kb))
+                return
+            
+            await status_msg.edit_text("❌ خطا: کانفیگ معتبر نیست یا سرور ایران پاسخ نداد.")
+
+        except Exception as e:
+            await status_msg.edit_text(f"❌ خطا: {e}")
+        finally:
+            if uid in USER_ACTIVE_TASKS: del USER_ACTIVE_TASKS[uid]
+
+    task = asyncio.create_task(heavy_config_check())
+    USER_ACTIVE_TASKS[uid] = task
+    return ConversationHandler.END
+async def finalize_sub_adding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    temp_link = context.user_data.get('temp_sub_link')
+    # فراخوانی لاجیک از فایل جدید
+    await tunnel_manager.finalize_sub_adding(update, context, temp_link)
+
+    # بازگشت به منو
+    await tunnel_list_menu(update, context)
+    return ConversationHandler.END
+async def test_single_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تست دستی و دقیق (Heavy Test) یک کانفیگ با UI حرفه‌ای"""
+    query = update.callback_query
+    try:
+        cid = int(query.data.split('_')[2])
+    except:
+        await query.answer("❌ خطا در دریافت شناسه کانفیگ.", show_alert=True)
+        return
+    
+    # نمایش لودینگ روی دکمه (بدون تغییر پیام اصلی)
+    try: await query.answer("🔄 آغاز تست دقیق (۱۰ مگابایت)...", cache_time=0)
+    except: pass
+
+    # 1. دریافت اطلاعات کانفیگ و سرور مانیتورینگ
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (cid,))
+        cfg = cur.fetchone()
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node = 1 AND is_active = 1")
+        monitor_node = cur.fetchone()
+    
+    # 2. بررسی موجود بودن
+    if not cfg:
+        await safe_edit_message(update, "❌ کانفیگ یافت نشد یا حذف شده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='tunnel_list_menu')]]))
+        return
+
+    if not monitor_node:
+        await safe_edit_message(update, "❌ سرور ایران (مانیتورینگ) فعال نیست!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data='tunnel_list_menu')]]))
+        return
+
+    # 3. نمایش پیام وضعیت (اگر پیام قبلی نتیجه تست نباشد)
+    if "نتیجه تست دقیق" not in query.message.text:
+        await safe_edit_message(
+            update, 
+            f"🔎 **در حال آنالیز عمیق (Heavy Test)...**\n"
+            f"🏷 `{cfg['name']}`\n"
+            f"⚖️ حجم تست: `10 MB` (دانلود + آپلود)\n"
+            f"⏳ لطفاً تا ۶۰ ثانیه صبر کنید..."
+        )
+    
+    # 4. آماده‌سازی اتصال SSH
+    ip, port, user = monitor_node['ip'], monitor_node['port'], monitor_node['username']
+    password = sec.decrypt(monitor_node['password'])
+    
+    # 5. ساخت دستور اجرا (با آرگومان 10.0 برای تست سنگین)
+    safe_link = shlex.quote(cfg['link'])
+    cmd = f"python3 -u /root/monitor_agent.py {safe_link} 10.0"
+    
+    loop = asyncio.get_running_loop()
+    try:
+        # ⚠️ افزایش تایم‌اوت به ۶۰ ثانیه برای تکمیل تست سنگین
+        ok, output = await loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 60)
+        res = extract_safe_json(output)
+        if not res:
+            res = {"status": "Error", "msg": "Invalid Output/Agent Crash"}
+        # 7. تحلیل نتایج و نمایش گزارش
+        if res.get("status") == "OK":
+            ping = res.get('ping', 0)
+            jitter = res.get('jitter', 0)
+            up = res.get('up', '0')
+            down = res.get('down', '0')
+            score = res.get('score', 0)
+            
+            # تعیین آیکون کیفیت بر اساس امتیاز
+            if score >= 8: q_icon = "💎 عالی"
+            elif score >= 5: q_icon = "⚖️ معمولی"
+            else: q_icon = "⚠️ ضعیف"
+            
+            # آپدیت دیتابیس با مقادیر واقعی تست سنگین
+            with db.get_connection() as (conn, cur):
+                cur.execute(
+                    "UPDATE tunnel_configs SET last_status='OK', last_ping=?, last_jitter=?, last_speed_up=?, last_speed_down=?, quality_score=? WHERE id=?",
+                    (ping, jitter, up, down, score, cid)
+                )
+                conn.commit()
+            
+            report = (
+                f"✅ **نتیجه تست دقیق (Heavy)** 🟢\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"🏷 نام: `{cfg['name']}`\n"
+                f"🛡 امتیاز کیفی: `{score}/10` ({q_icon})\n\n"
+                f"📶 **Ping:** `{ping} ms`\n"
+                f"📉 **Jitter:** `{jitter} ms`\n"
+                f"📥 **Download:** `{down} MB/s`\n"
+                f"📤 **Upload:** `{up} MB/s`"
+            )
+        else:
+            # ثبت خطا در دیتابیس
+            with db.get_connection() as (conn, cur):
+                cur.execute("UPDATE tunnel_configs SET last_status='Fail', quality_score=0 WHERE id=?", (cid,))
+                conn.commit()
+            
+            error_msg = res.get('msg', 'Timeout/Filtering')
+            report = (
+                f"⛔️ **عدم برقراری ارتباط** 🔴\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"🏷 نام: `{cfg['name']}`\n\n"
+                f"❌ خطا: `{error_msg}`\n"
+                f"💡 _ممکن است سرور پاسخ ندهد، تایم‌اوت شده باشد یا آی‌پی فیلتر باشد._"
+            )
+            
+    except Exception as e:
+        report = f"❌ خطای سیستمی در اجرای تست:\n`{e}`"
+
+    # استفاده از ماژول کیبورد
+    reply_markup = keyboard.config_test_result_kb(cid)
+    
+    await safe_edit_message(update, report, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def view_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش کد خام کانفیگ به کاربر"""
+    query = update.callback_query
+    cid = int(query.data.split('_')[2])
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (cid,))
+        cfg = cur.fetchone()
+        
+    if not cfg:
+        await query.answer("❌ کانفیگ یافت نشد.", show_alert=True)
+        return
+
+    content = cfg['link']
+    
+    # اگر جیسون بود، مرتبش کن
+    if cfg['type'] == 'json':
+        try:
+            parsed = json.loads(content)
+            content = json.dumps(parsed, indent=2)
+        except: pass
+
+    # اگر خیلی طولانی بود فایل بده، وگرنه متن
+    if len(content) > 4000:
+        f = io.BytesIO(content.encode())
+        f.name = f"{cfg['name']}.json" if cfg['type'] == 'json' else "config.txt"
+        await query.message.reply_document(document=f, caption="📄 فایل کانفیگ")
+    else:
+        # ارسال در قالب کد برای کپی راحت
+        await query.message.reply_text(f"📝 **کد کانفیگ:**\n\n`{content}`", parse_mode='Markdown')
+    
+    try: await query.answer()
+    except: pass
+
+async def delete_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    cid = int(query.data.split('_')[2])
+    uid = update.effective_user.id
+
+    db.delete_tunnel_config(cid, uid)
+
+    await query.answer("✅ کانفیگ حذف شد.")
+    await tunnel_list_menu(update, context)
+# ==============================================================================
+# 🧩 MISSING FUNCTIONS (ADDED TO FIX CRASH)
+# ==============================================================================
+
+async def advanced_monitoring_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی تنظیمات پیشرفته مانیتورینگ"""
+    uid = update.effective_user.id
+    if update.callback_query:
+        await update.callback_query.answer()
+        
+    s_size = db.get_setting(uid, 'monitor_small_size') or '0.5'
+    b_size = db.get_setting(uid, 'monitor_big_size') or '10'
+    
+    # استفاده از کیبورد موجود در keyboard.py
+    reply_markup = keyboard.advanced_monitor_kb(s_size, b_size)
+    txt = (
+        "⚙️ **تنظیمات پیشرفته مانیتورینگ تانل**\n"
+        "➖➖➖➖➖➖➖➖➖➖\n"
+        "🔹 **تست سبک:** هر ۱۰ دقیقه برای بررسی پینگ و اتصال (کم‌مصرف).\n"
+        "🔸 **تست سنگین:** هر چند ساعت برای بررسی دقیق سرعت و کیفیت.\n\n"
+        "👇 مقادیر مورد نظر را تغییر دهید:"
+    )
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+async def set_small_size_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'monitor_small_size') or '0.5'
+    reply_markup = keyboard.monitor_size_kb(curr, 'small')
+    await safe_edit_message(update, "🔹 حجم دانلود برای **تست سبک** (Ping Check):", reply_markup=reply_markup)
+
+async def set_big_size_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'monitor_big_size') or '10'
+    reply_markup = keyboard.monitor_size_kb(curr, 'big')
+    await safe_edit_message(update, "🔸 حجم دانلود برای **تست سنگین** (Speed Test):", reply_markup=reply_markup)
+
+async def set_big_interval_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'monitor_big_interval') or '60'
+    reply_markup = keyboard.monitor_interval_kb(curr)
+    await safe_edit_message(update, "⏰ فاصله زمانی اجرای **تست سنگین**:", reply_markup=reply_markup)
+
+async def save_setting_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    uid = update.effective_user.id
+    data = query.data # e.g., save_small_0.5, save_int_60
+    
+    parts = data.split('_')
+    setting_type = parts[1] # small, big, int
+    value = parts[2]
+    
+    if value == 'custom':
+        map_txt = {'small': "✍️ حجم تست سبک (MB) را وارد کنید:", 'big': "✍️ حجم تست سنگین (MB) را وارد کنید:", 'int': "✍️ فاصله زمانی (دقیقه) را وارد کنید:"}
+        state_map = {'small': GET_CUSTOM_SMALL_SIZE, 'big': GET_CUSTOM_BIG_SIZE, 'int': GET_CUSTOM_BIG_INTERVAL}
+        
+        await safe_edit_message(update, map_txt[setting_type], reply_markup=keyboard.get_cancel_markup())
+        return state_map[setting_type]
+    
+    key_map = {'small': 'monitor_small_size', 'big': 'monitor_big_size', 'int': 'monitor_big_interval'}
+    db.set_setting(uid, key_map[setting_type], value)
+    
+    await query.answer("✅ ذخیره شد.")
+    await advanced_monitoring_settings(update, context)
+
+async def custom_small_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float(update.message.text)
+        db.set_setting(update.effective_user.id, 'monitor_small_size', val)
+        await update.message.reply_text("✅ ذخیره شد.")
+        await advanced_monitoring_settings(update, context)
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("❌ عدد نامعتبر.")
+        return GET_CUSTOM_SMALL_SIZE
+
+async def custom_big_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float(update.message.text)
+        db.set_setting(update.effective_user.id, 'monitor_big_size', val)
+        await update.message.reply_text("✅ ذخیره شد.")
+        await advanced_monitoring_settings(update, context)
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("❌ عدد نامعتبر.")
+        return GET_CUSTOM_BIG_SIZE
+
+async def custom_int_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        db.set_setting(update.effective_user.id, 'monitor_big_interval', val)
+        await update.message.reply_text("✅ ذخیره شد.")
+        await advanced_monitoring_settings(update, context)
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("❌ عدد نامعتبر.")
+        return GET_CUSTOM_BIG_INTERVAL
+
+async def show_config_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش جزئیات یک کانفیگ خاص"""
+    query = update.callback_query
+    try:
+        cid = int(query.data.split('_')[2])
+    except:
+        await query.answer("❌ خطا در شناسه کانفیگ")
+        return
+
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (cid,))
+        cfg = cur.fetchone()
+        
+    if not cfg:
+        try: await query.answer("❌ کانفیگ یافت نشد یا حذف شده است.", show_alert=True)
+        except: pass
+        # رفرش لیست
+        await tunnel_list_menu(update, context)
+        return
+
+    # تلاش برای پیدا کردن آیدی والد (اگر ساب آیتم باشد) برای دکمه بازگشت
+    parent_id = None
+    if cfg['type'] == 'sub_item':
+        if " | " in cfg['name']:
+            sub_name = cfg['name'].split(" | ")[0]
+            with db.get_connection() as (conn, cur):
+                cur.execute("SELECT id FROM tunnel_configs WHERE name=%s AND type='sub_source'", (sub_name,))
+                parent = cur.fetchone()
+                if parent:
+                    parent_id = parent['id']
+
+    status_icon = "🟢" if cfg['last_status'] == 'OK' else "🔴"
+    ping_txt = f"{cfg['last_ping']} ms" if cfg['last_ping'] > 0 else "N/A"
+    
+    txt = (
+        f"🏷 **جزئیات کانفیگ**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📝 **نام:** `{cfg['name']}`\n"
+        f"📡 **وضعیت:** {status_icon} `{cfg['last_status']}`\n"
+        f"📶 **پینگ:** `{ping_txt}`\n"
+        f"🛡 **امتیاز کیفی:** `{cfg['quality_score']}/10`\n\n"
+        f"📅 تاریخ ثبت: `{cfg['added_at']}`"
+    )
+
+    # استفاده از کیبورد موجود در keyboard.py
+    reply_markup = keyboard.config_detail_kb(cid, parent_id)
+    
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+async def copy_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """کپی کردن لینک کانفیگ"""
+    query = update.callback_query
+    cid = int(query.data.split('_')[2])
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT link FROM tunnel_configs WHERE id=%s", (cid,))
+        cfg = cur.fetchone()
+        
+    if cfg:
+        await query.message.reply_text(f"`{cfg['link']}`", parse_mode='Markdown')
+        await query.answer("✅ لینک کانفیگ ارسال شد.")
+    else:
+        await query.answer("❌ کانفیگ پیدا نشد.", show_alert=True)
+
+async def qr_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش QR Code کانفیگ"""
+    query = update.callback_query
+    cid = int(query.data.split('_')[2])
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT link, name FROM tunnel_configs WHERE id=%s", (cid,))
+        cfg = cur.fetchone()
+
+    if not cfg:
+        await query.answer("❌ کانفیگ پیدا نشد.", show_alert=True)
+        return
+
+    await query.answer("🔄 در حال ایجاد QR Code...")
+    try:
+        encoded_link = urllib.parse.quote(cfg['link'])
+        qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={encoded_link}"
+        
+        await query.message.reply_photo(
+            photo=qr_url, 
+            caption=f"🔲 **QR Code:**\n`{cfg['name']}`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await query.message.reply_text(f"❌ امکان ارسال عکس وجود ندارد.\nلینک:\n`{cfg['link']}`", parse_mode='Markdown')
+
+
+async def manual_update_sub_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """بروزرسانی دستی یک اشتراک خاص"""
+    query = update.callback_query
+    sub_id = int(query.data.split('_')[2])
+    
+    await query.answer("⏳ درخواست آپدیت ثبت شد...", show_alert=True)
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE id=%s", (sub_id,))
+        sub = cur.fetchone()
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+        monitor = cur.fetchone()
+    
+    if not sub or sub['type'] != 'sub_source':
+        try: await query.message.reply_text("❌ اشتراک یافت نشد.")
+        except: pass
+        return
+
+    if not monitor:
+        try: await query.message.reply_text("❌ سرور مانیتورینگ فعال نیست.")
+        except: pass
+        return
+
+    asyncio.create_task(run_sub_update_background(context, update.effective_user.id, sub['link'], sub['name'], sub_id, monitor))
+
+async def run_sub_update_background(context, uid, link, sub_name, sub_id, monitor):
+    try:
+        # اطلاع‌رسانی اولیه
+        try:
+            await context.bot.send_message(uid, f"🔄 **فرآیند آپدیت اشتراک {sub_name} آغاز شد...**\n⏳ در حال پاکسازی قدیمی‌ها و دریافت لیست جدید...")
+        except: pass
+
+        # 1. پاکسازی کانفیگ‌های قدیمی این اشتراک (بسیار مهم برای جلوگیری از تکرار)
+        with db.get_connection() as (conn, cur):
+            # حذف تمام زیرمجموعه‌های قبلی که تایپشان sub_item است و نامشان با اسم اشتراک شروع می‌شود
+            cur.execute("DELETE FROM tunnel_configs WHERE owner_id=%s AND name LIKE %s AND type='sub_item'", (uid, f"{sub_name} | %"))
+            conn.commit()
+
+        ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+        password = sec.decrypt(monitor['password'])
+        
+        # استفاده از فلگ -u برای دریافت خروجی لحظه‌ای
+        cmd = f"python3 -u /root/monitor_agent.py '{link}'"
+        
+        client = ServerMonitor.get_ssh_client(ip, port, user, password)
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        
+        new_count = 0
+        active_count = 0
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        # خواندن خروجی خط به خط
+        for line in iter(stdout.readline, ""):
+            line = line.strip()
+            if not line: continue
+            
+            import re
+            json_match = re.search(r'(\{.*\})', line)
+            if json_match:
+                try:
+                    data = json.loads(json_match.group(1))
+                    
+                    # الف) آپدیت اطلاعات حجم (Meta)
+                    if data.get('type') == 'meta' and 'sub_info' in data:
+                        info_str = json.dumps(data['sub_info'])
+                        with db.get_connection() as (conn, cur):
+                            cur.execute("UPDATE tunnel_configs SET sub_info=%s WHERE id=%s", (info_str, sub_id))
+                            conn.commit()
+                            
+                    # ب) افزودن کانفیگ‌های جدید (Result)
+                    elif data.get('type') == 'result':
+                        conf_link = data.get('link')
+                        name = data.get('name', 'Unknown')
+                        status = data.get('status')
+                        ping = data.get('ping', 0) # دریافت پینگ لحظه‌ای
+                        
+                        # محاسبه کیفیت و امتیاز
+                        quality = 10
+                        if status != 'OK':
+                            quality = 0
+                        elif ping > 1000:
+                            quality = 3
+                        elif ping > 500:
+                            quality = 6
+                        
+                        if status == 'OK': active_count += 1
+
+                        # نام نهایی ترکیبی
+                        final_name = f"{sub_name} | {name}"
+                        
+                        with db.get_connection() as (conn, cur):
+                            # درج مستقیم (چون قبلاً قدیمی‌ها را پاک کردیم، نیازی به چک کردن تکراری نیست مگر لینک دقیقاً یکی باشد)
+                            cur.execute(
+                                """INSERT INTO tunnel_configs (owner_id, type, link, name, added_at, quality_score, last_status, last_ping) 
+                                   VALUES (%s, 'sub_item', %s, %s, %s, %s, %s, %s) 
+                                   ON CONFLICT(link) DO UPDATE SET last_status=excluded.last_status, last_ping=excluded.last_ping""",
+                                (uid, conf_link, final_name, now, quality, status, ping)
+                            )
+                            new_count += 1
+                            conn.commit()
+                except: pass
+        
+        client.close()
+        
+        # ارسال گزارش نهایی شیک
+        msg = (
+            f"✅ **آپدیت اشتراک {sub_name} تکمیل شد.**\n"
+            f"➖➖➖➖➖➖➖➖➖➖\n"
+            f"📥 **تعداد کل دریافت شده:** `{new_count}`\n"
+            f"🟢 **کانفیگ‌های سالم:** `{active_count}`\n"
+            f"🗑 کانفیگ‌های منقضی شده حذف شدند."
+        )
+            
+        try:
+            await context.bot.send_message(uid, msg, parse_mode='Markdown')
+        except: pass
+
+    except Exception as e:
+        logger.error(f"Sub Update Error: {e}")
+        try: await context.bot.send_message(uid, f"❌ خطا در آپدیت: {e}")
+        except: pass
+async def delete_item_from_list_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حذف آیتم و رفرش کردن صحیح لیست"""
+    query = update.callback_query
+    parts = query.data.split('_')
+    # فرمت: del_list_item_{id}_{mode}_{page}
+    
+    cid = int(parts[3])
+    mode = parts[4]
+    page = int(parts[5])
+    uid = update.effective_user.id
+    
+    # 1. حذف از دیتابیس
+    db.delete_tunnel_config(cid, uid)
+    
+    try:
+        await query.answer("🗑 حذف شد.", show_alert=False)
+    except: pass
+    
+    # 2. محاسبه اینکه آیا صفحه فعلی هنوز آیتم دارد یا خیر
+    # اگر آخرین آیتم صفحه را حذف کرده باشیم، باید به صفحه قبل برویم
+    with db.get_connection() as (conn, cur):
+        # شمارش آیتم‌های باقی‌مانده
+        base_query = "SELECT COUNT(*) FROM tunnel_configs WHERE owner_id=%s AND type != 'sub_source'"
+        if mode == 'single':
+            base_query += " AND type='single'"
+        
+        cur.execute(base_query, (uid,))
+        total_count = cur.fetchone()[0]
+    
+    LIMIT = 10
+    total_pages = (total_count + LIMIT - 1) // LIMIT
+    
+    # اگر صفحه‌ای که توش بودیم دیگه وجود نداره (مثلا صفحه ۲ بودیم و آیتم‌ها کم شد و شد ۱ صفحه)
+    # به آخرین صفحه موجود برمی‌گردیم
+    if page > total_pages and total_pages > 0:
+        page = total_pages
+    elif total_pages == 0:
+        page = 1 # اگر کلا خالی شد
+
+    # 3. بازسازی کال‌بک برای رفرش کردن لیست
+    # state=1 یعنی در حالت حذف باقی بمان
+    new_data = f"list_mode_{mode}_{page}_1"
+    
+    # فراخوانی تابع نمایش
+    await show_tunnels_by_mode(update, context, custom_data=new_data)
+# ==============================================================================
+# 🚀 MASS UPDATE & HEAVY TEST LOGIC (UPDATED WITH SINGLES)
+# ==============================================================================
+
+async def mass_update_test_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع عملیات بروزرسانی همگانی و تست دقیق (ضد کرش)"""
+    logger.info("🚀 Mass Update Triggered")
+    query = update.callback_query
+    uid = update.effective_user.id
+    
+    # 1. پاسخ به دکمه (با محافظت ضد کرش)
+    try:
+        await query.answer("🚀 عملیات آغاز شد...", show_alert=False)
+    except Exception as e:
+        logger.warning(f"Callback answer ignored in mass update: {e}")
+
+    # 2. دریافت اطلاعات از دیتابیس
+    try:
+        with db.get_connection() as (conn, cur):
+            # دریافت ساب‌ها
+            cur.execute("SELECT * FROM tunnel_configs WHERE owner_id=%s AND type='sub_source'", (uid,))
+            subs = cur.fetchall()
+            # دریافت کانفیگ‌های تکی
+            cur.execute("SELECT * FROM tunnel_configs WHERE owner_id=%s AND type='single'", (uid,))
+            singles = cur.fetchall()
+            # دریافت سرور مانیتورینگ
+            cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+            monitor = cur.fetchone()
+
+        # بررسی اینکه آیا اصلا چیزی برای تست هست؟
+        if not subs and not singles:
+            await query.message.reply_text("❌ هیچ اشتراک یا کانفیگ تکی ندارید.")
+            return
+
+        if not monitor:
+            await query.message.reply_text("❌ سرور مانیتورینگ (Iran Node) فعال نیست.")
+            return
+        
+        status_msg = await query.message.reply_text(
+            f"⏳ **در حال آماده‌سازی برای تست همگانی...**\n"
+            f"📦 تعداد ساب‌ها: `{len(subs)}`\n"
+            f"👤 تعداد تکی‌ها: `{len(singles)}`\n"
+            f"📡 سرور تست: `{monitor['name']}`\n\n"
+            f"لطفاً صبر کنید..."
+        )
+
+        # اجرای عملیات سنگین در پس‌زمینه
+        # نکته: مطمئن شوید tunnel_manager در بالای فایل ایمپورت شده باشد
+        asyncio.create_task(tunnel_manager.run_mass_update_process(context, uid, subs, singles, monitor, status_msg))
+    
+    except Exception as e:
+        logger.error(f"Error in mass_update_test_start: {e}")
+        await context.bot.send_message(chat_id=uid, text=f"❌ خطای داخلی: {e}")
+async def show_add_service_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی انتخاب افزودن سرویس"""
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    txt = (
+        "➕ **افزودن سرویس جدید**\n\n"
+        "لطفاً نوع سرویسی که می‌خواهید اضافه کنید را انتخاب نمایید:"
+    )
+    # فراخوانی کیبورد جدید
+    reply_markup = keyboard.add_service_selection_kb()
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+
+async def show_lists_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی انتخاب لیست‌ها"""
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    txt = (
+        "📂 **مدیریت لیست‌ها**\n\n"
+        "لطفاً انتخاب کنید کدام لیست را می‌خواهید مشاهده کنید:"
+    )
+    # فراخوانی کیبورد جدید
+    reply_markup = keyboard.lists_dashboard_kb()
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+async def show_account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش اطلاعات حساب کاربری و کیف پول به صورت یکجا"""
+    if update.callback_query:
+        await update.callback_query.answer()
+    
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    
+    # محاسبات تاریخ و نوع اکانت
+    try:
+        join_date = datetime.strptime(user['added_date'], '%Y-%m-%d %H:%M:%S')
+        j_join = jdatetime.date.fromgregorian(date=join_date.date())
+        join_str = f"{j_join.day} {jdatetime.date.j_months_fa[j_join.month - 1]} {j_join.year}"
+    except:
+        join_str = "نامشخص"
+
+    access, time_left = db.check_access(uid, SUPER_ADMIN_ID)
+    if uid == SUPER_ADMIN_ID:
+        sub_type = "👑 مدیریت کل"
+        expiry_str = "♾ نامحدود"
+    else:
+        sub_type = "💎 پریمیوم (VIP)" if user['plan_type'] == 1 else "👤 عادی"
+        expiry_str = f"{time_left} روز مانده" if isinstance(time_left, int) else "نامحدود"
+
+    # آمار سرورها
+    servers = db.get_all_user_servers(uid)
+    active_srv = sum(1 for s in servers if s['is_active'])
+    
+    # ✅ اصلاح شده: دریافت موجودی بدون استفاده از .get()
+    balance = user['wallet_balance'] if user['wallet_balance'] else 0
+
+    txt = (
+        f"👤 **داشبورد حساب کاربری**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"🏷 **نام:** `{user['full_name']}`\n"
+        f"🆔 **شناسه:** `{user['user_id']}`\n"
+        f"📅 **عضویت:** `{join_str}`\n\n"
+        
+        f"💳 **وضعیت اشتراک:**\n"
+        f"   ├ نوع: {sub_type}\n"
+        f"   ├ اعتبار: `{expiry_str}`\n"
+        f"   └ لیمیت سرور: `{user['server_limit']} عدد`\n\n"
+        
+        f"💰 **کیف پول:**\n"
+        f"   └ موجودی: `{balance:,} تومان`\n\n"
+        
+        f"🖥 **سرورهای فعال:** `{active_srv}` از `{len(servers)}`"
+    )
+
+    reply_markup = keyboard.account_dashboard_kb()
+    await safe_edit_message(update, txt, reply_markup=reply_markup)
+async def refresh_conf_dash_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اجرای تست سبک (پینگ) برای همه کانفیگ‌ها و بازگشت به داشبورد"""
+    query = update.callback_query
+    uid = update.effective_user.id
+    
+    # نمایش پیام موقت
+    try: await query.answer("🚀 در حال تست پینگ همگانی...", cache_time=1)
+    except: pass
+    
+    status_msg = await query.message.reply_text(
+        "⏳ **در حال بروزرسانی وضعیت (Ping Only)...**\n"
+        "سرعت این عملیات بالاست، لطفاً صبر کنید."
+    )
+    
+    with db.get_connection() as (conn, cur):
+        cur.execute("SELECT * FROM tunnel_configs WHERE owner_id=%s", (uid,))
+        configs = cur.fetchall()
+        cur.execute("SELECT * FROM servers WHERE is_monitor_node=1 AND is_active=1")
+        monitor = cur.fetchone()
+
+    if not monitor:
+        await status_msg.edit_text("❌ سرور مانیتورینگ فعال نیست.")
+        return
+
+    # اجرای عملیات در پس‌زمینه (نسخه اصلاح شده Ping Only)
+    await run_quick_ping_check(context, uid, configs, monitor)
+    
+    # حذف پیام انتظار
+    try: await status_msg.delete()
+    except: pass
+    
+    # بازگشت خودکار به داشبورد بروز شده
+    await config_stats_dashboard(update, context)
+
+async def run_quick_ping_check(context, uid, configs, monitor):
+    """لاجیک تست بسیار سریع و سبک (فقط پینگ)"""
+    ip, port, user = monitor['ip'], monitor['port'], monitor['username']
+    password = sec.decrypt(monitor['password'])
+    loop = asyncio.get_running_loop()
+
+    # پردازش دسته‌ای (۵ تایی) برای سرعت بالا
+    chunk_size = 5
+    for i in range(0, len(configs), chunk_size):
+        chunk = configs[i:i+chunk_size]
+        tasks = []
+        
+        for cfg in chunk:
+            # ارسال سایز 0.2 مگابایت فقط برای هندشیک و پینگ (بسیار سبک)
+            # و تایم اوت کوتاه (۱۰ ثانیه)
+            link_arg = cfg['link']
+            if cfg['type'] == 'json' or link_arg.strip().startswith('{'):
+                safe_link = link_arg.replace('"', '\\"')
+                cmd = f'python3 /root/monitor_agent.py "{safe_link}" 0.2'
+            else:
+                cmd = f"python3 /root/monitor_agent.py '{link_arg}' 0.2"
+            
+            tasks.append(loop.run_in_executor(None, ServerMonitor.run_remote_command, ip, port, user, password, cmd, 10))
+        
+        results = await asyncio.gather(*tasks)
+        
+        with db.get_connection() as (conn, cur):
+            for idx, (ok, output) in enumerate(results):
+                cid = chunk[idx]['id']
+                try:
+                    res = extract_safe_json(output)
+                    if res and res.get("status") == "OK":
+                        # محاسبه امتیاز فقط بر اساس پینگ و جیتر (چون سرعت تست نشده)
+                        ping = res.get('ping', 0)
+                        jitter = res.get('jitter', 0)
+                        
+                        # فرمول ساده امتیازدهی پینگ
+                        new_score = 10
+                        if ping > 1000: new_score = 2
+                        elif ping > 500: new_score = 5
+                        elif ping > 200: new_score = 8
+                        
+                        cur.execute(
+                            "UPDATE tunnel_configs SET last_status='OK', last_ping=?, last_jitter=?, quality_score=? WHERE id=?",
+                            (ping, jitter, new_score, cid)
+                        )
+                    else:
+                        cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=?", (cid,))
+                except:
+                    cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=?", (cid,))
+            conn.commit()
+# ==============================================================================
+# END OF MISSING FUNCTIONS
+# ==============================================================================
 def main():
     print("🚀 SONAR ULTRA PRO RUNNING...")
-    
-    # تنظیمات اپلیکیشن با تایم‌اوت‌های افزایش یافته برای پایداری در شبکه
     app = (
         ApplicationBuilder()
         .token(TOKEN)
-        .connect_timeout(60.0)  # 60 ثانیه انتظار برای اتصال
-        .read_timeout(60.0)     # 60 ثانیه انتظار برای خواندن
-        .write_timeout(60.0)    # 60 ثانیه انتظار برای نوشتن
+        .connect_timeout(60.0)  # 60 ثانیه انتظار برای اتصال (بهینه برای شبکه ایران)
+        .read_timeout(60.0)     # 60 ثانیه انتظار برای دریافت پاسخ
+        .write_timeout(60.0)    # 60 ثانیه انتظار برای ارسال
         .build()
     )
     app.add_error_handler(error_handler)
 
-    # فیلتر متن برای هندلرها (متن باشد اما دستور نباشد)
     text_filter = filters.TEXT & ~filters.COMMAND
 
     # ==========================================================================
     # 1. CONVERSATION HANDLER (مدیریت مکالمات چند مرحله‌ای)
     # ==========================================================================
     conv_handler = ConversationHandler(
-        allow_reentry=True, 
+        allow_reentry=True,
         entry_points=[
             # --- Admin Panel Actions ---
-            CallbackQueryHandler(add_new_user_start, pattern='^add_new_admin$'), 
-            CallbackQueryHandler(admin_user_actions, pattern='^admin_u_limit_'),
-            CallbackQueryHandler(admin_user_actions, pattern='^admin_u_settime_'),
-            CallbackQueryHandler(admin_search_start, pattern='^admin_search_start$'),
+            CallbackQueryHandler(admin_panel.add_new_user_start, pattern='^add_new_admin$'),
+            CallbackQueryHandler(admin_panel.admin_user_actions, pattern='^admin_u_limit_'),
+            CallbackQueryHandler(admin_panel.admin_user_actions, pattern='^admin_u_settime_'),
+            CallbackQueryHandler(admin_panel.admin_search_start, pattern='^admin_search_start$'),
             CallbackQueryHandler(admin_backup_restore_start, pattern='^admin_backup_restore_start$'),
-            CallbackQueryHandler(admin_broadcast_start, pattern='^admin_broadcast_start$'),
-            
+            CallbackQueryHandler(admin_panel.admin_broadcast_start, pattern='^admin_broadcast_start$'),
+            CallbackQueryHandler(admin_panel.admin_user_servers_report, pattern='^admin_u_servers_'),
+            CallbackQueryHandler(admin_panel.admin_search_servers_by_uid_start, pattern='^admin_search_servers_by_uid_start$'),
+            CallbackQueryHandler(admin_server_detail_action, pattern='^admin_detail_'),
+            CallbackQueryHandler(admin_panel.admin_full_report_global_action, pattern='^admin_full_report_global$'),
             # --- Payment Management (Admin) ---
             CallbackQueryHandler(admin_payment_settings, pattern='^admin_pay_settings$'),
             CallbackQueryHandler(add_pay_method_start, pattern='^add_pay_method_'),
@@ -3830,56 +4478,95 @@ def main():
             # --- Group & Server Management ---
             CallbackQueryHandler(add_group_start, pattern='^add_group$'),
             CallbackQueryHandler(add_server_start_menu, pattern='^add_server$'),
-            
+
             # --- Tools & Settings ---
             CallbackQueryHandler(manual_ping_start, pattern='^manual_ping_start$'),
             CallbackQueryHandler(add_channel_start, pattern='^add_channel$'),
             CallbackQueryHandler(ask_custom_interval, pattern='^setcron_custom$'),
             CallbackQueryHandler(edit_expiry_start, pattern='^act_editexpiry_'),
             CallbackQueryHandler(ask_terminal_command, pattern='^cmd_terminal_'),
-            
+
             # --- Resource Limits ---
             CallbackQueryHandler(resource_settings_menu, pattern='^settings_thresholds$'),
             CallbackQueryHandler(ask_cpu_limit, pattern='^set_cpu_limit$'),
             CallbackQueryHandler(ask_ram_limit, pattern='^set_ram_limit$'),
             CallbackQueryHandler(ask_disk_limit, pattern='^set_disk_limit$'),
-            
+
             # --- User & Reports ---
             CallbackQueryHandler(user_profile_menu, pattern='^user_profile$'),
             CallbackQueryHandler(web_token_action, pattern='^gen_web_token$'),
             CallbackQueryHandler(send_global_full_report_action, pattern='^act_global_full_report$'),
-            
+
             # --- Auto Reboot ---
             CallbackQueryHandler(ask_reboot_time, pattern='^start_set_reboot$'),
             CallbackQueryHandler(auto_reboot_menu, pattern='^auto_reboot_menu$'),
             CallbackQueryHandler(save_auto_reboot_final, pattern='^disable_reboot$'),
             CallbackQueryHandler(save_auto_reboot_final, pattern='^savereb_'),
+            CallbackQueryHandler(dashboard_sort_menu, pattern='^dashboard_sort_menu$'),
+            CallbackQueryHandler(set_dashboard_sort_action, pattern='^set_dash_sort_'),
+            CallbackQueryHandler(admin_panel.admin_all_servers_report, pattern='^admin_all_servers_'),
 
+            # --- Tunnel Monitoring (Iran Node) ---
+            CallbackQueryHandler(monitor_settings_panel, pattern='^monitor_settings_panel$'),
+            CallbackQueryHandler(set_iran_monitor_start, pattern='^set_iran_monitor_server$'),
+            CallbackQueryHandler(delete_monitor_node, pattern='^delete_monitor_node$'),
+            CallbackQueryHandler(update_monitor_node, pattern='^update_monitor_node$'),
+
+            # --- Tunnel Config Management (New Flow) ---
+            CallbackQueryHandler(add_config_start, pattern='^add_tunnel_config$'),
+            CallbackQueryHandler(mode_ask_json, pattern='^mode_add_json$'),
+            CallbackQueryHandler(mode_ask_sub, pattern='^mode_add_sub$'),
+            CallbackQueryHandler(config_stats_dashboard, pattern='^show_config_stats$'),
+            
+            # --- Tunnel List Actions ---
+            CallbackQueryHandler(tunnel_list_menu, pattern='^tunnel_list_menu$'),
+            CallbackQueryHandler(test_single_config, pattern='^test_conf_'),
+            CallbackQueryHandler(view_config_action, pattern='^view_conf_'),
+            CallbackQueryHandler(delete_config_action, pattern='^del_conf_'),
+            
+            # --- Config Detail Handlers (New) ---
+            CallbackQueryHandler(show_config_details, pattern='^conf_detail_'),
+            CallbackQueryHandler(copy_config_action, pattern='^copy_conf_'),
+            CallbackQueryHandler(qr_config_action, pattern='^qr_conf_'),
+            CallbackQueryHandler(manage_single_sub_menu, pattern='^manage_sub_'),
+            CallbackQueryHandler(get_sub_links_action, pattern='^get_sub_links_'), # ✅ اضافه شد
+            
+            # ... بقیه هندلرها ...
+            CallbackQueryHandler(topics.setup_group_notify_start, pattern='^setup_group_notify$'),
+            CallbackQueryHandler(topics.get_group_id_step, pattern='^get_group_id_step$'),
+            CallbackQueryHandler(config_cron_menu, pattern='^settings_conf_cron$'),
+            CallbackQueryHandler(set_config_cron_action, pattern='^setconfcron_'),
+            # ... در لیست CallbackQueryHandler ها ...
+            CallbackQueryHandler(toggle_config_alert, pattern='^toggle_confalert_'),
+            CallbackQueryHandler(header_none_action, pattern='^header_none$'),
             # --- Placeholders ---
-            CallbackQueryHandler(lambda u,c: u.callback_query.answer("🔜 به‌زودی!", show_alert=True), pattern='^dev_feature$')
+            CallbackQueryHandler(lambda u, c: u.callback_query.answer("🔜 به‌زودی!", show_alert=True), pattern='^dev_feature$')
         ],
         states={
-            # --- Add Server States ---
-            SELECT_ADD_METHOD: [
-                CallbackQueryHandler(add_server_step_start, pattern='^add_method_step$'),
-                CallbackQueryHandler(add_server_linear_start, pattern='^add_method_linear$')
+            SELECT_CONFIG_TYPE: [
+                CallbackQueryHandler(handle_config_type_selection, pattern='^type_'),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$'),
             ],
             GET_LINEAR_DATA: [MessageHandler(text_filter, process_linear_data)],
-            
+            topics.GET_GROUP_ID_FOR_TOPICS: [MessageHandler(filters.TEXT & ~filters.COMMAND, topics.perform_group_setup)],
+            # --- Advanced Monitor Settings States ---
+            GET_CUSTOM_SMALL_SIZE: [MessageHandler(filters.TEXT, custom_small_handler)],
+            GET_CUSTOM_BIG_SIZE: [MessageHandler(filters.TEXT, custom_big_handler)],
+            GET_CUSTOM_BIG_INTERVAL: [MessageHandler(filters.TEXT, custom_int_handler)],
             # --- Admin States ---
-            ADD_ADMIN_ID: [MessageHandler(text_filter, get_new_user_id)],
-            ADD_ADMIN_DAYS: [MessageHandler(text_filter, get_new_user_days)],
-            ADMIN_SET_LIMIT: [MessageHandler(text_filter, admin_set_limit_handler)],
-            ADMIN_SET_TIME_MANUAL: [MessageHandler(text_filter, admin_set_days_handler)],
-            ADMIN_SEARCH_USER: [MessageHandler(text_filter, admin_search_handler)],
-            ADMIN_RESTORE_DB: [MessageHandler(filters.Document.ALL, admin_backup_restore_handler)],
-            GET_BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND, admin_broadcast_send)],
-
-            # --- Payment Add States (NEW) ---
+            ADD_ADMIN_ID: [MessageHandler(text_filter, admin_panel.get_new_user_id)],
+            ADD_ADMIN_DAYS: [MessageHandler(text_filter, admin_panel.get_new_user_days)],
+            ADMIN_SET_LIMIT: [MessageHandler(text_filter, admin_panel.admin_set_limit_handler)],
+            ADMIN_SET_TIME_MANUAL: [MessageHandler(text_filter, admin_panel.admin_set_days_handler)],
+            ADMIN_SEARCH_USER: [MessageHandler(text_filter, admin_panel.admin_search_handler)],
+            ADMIN_RESTORE_DB: [MessageHandler(filters.Document.ALL, admin_backup_restore_handler)], # در bot.py ماند
+            GET_BROADCAST_MSG: [MessageHandler(filters.ALL & ~filters.COMMAND, admin_panel.admin_broadcast_send)],
+            # --- New Admin Report State ---
+            ADMIN_GET_UID_FOR_REPORT: [MessageHandler(filters.TEXT, admin_panel.admin_report_by_uid_handler)],
+            # --- Payment Add States ---
             ADD_PAY_NET: [MessageHandler(text_filter, get_pay_network)],
             ADD_PAY_ADDR: [MessageHandler(text_filter, get_pay_address)],
             ADD_PAY_HOLDER: [MessageHandler(text_filter, get_pay_holder)],
-            
 
             # --- General Server States ---
             GET_GROUP_NAME: [MessageHandler(text_filter, get_group_name)],
@@ -3890,7 +4577,7 @@ def main():
             GET_PASS: [MessageHandler(text_filter, get_srv_pass)],
             GET_EXPIRY: [MessageHandler(text_filter, get_srv_expiry)],
             SELECT_GROUP: [CallbackQueryHandler(select_group)],
-            
+
             # --- Tools States ---
             GET_MANUAL_HOST: [MessageHandler(text_filter, perform_manual_ping)],
             GET_CHANNEL_FORWARD: [MessageHandler(filters.ALL & ~filters.COMMAND, get_channel_forward)],
@@ -3901,7 +4588,7 @@ def main():
                 MessageHandler(text_filter, run_terminal_action),
                 CallbackQueryHandler(close_terminal_session, pattern='^exit_terminal$')
             ],
-            
+
             # --- Resource Limit States ---
             GET_CPU_LIMIT: [MessageHandler(text_filter, save_cpu_limit)],
             GET_RAM_LIMIT: [MessageHandler(text_filter, save_ram_limit)],
@@ -3912,6 +4599,32 @@ def main():
             GET_RECEIPT: [
                 MessageHandler(filters.PHOTO | filters.Document.IMAGE, process_receipt_upload)
             ],
+            # --- Iran Server States ---
+            GET_IRAN_NAME: [
+                MessageHandler(text_filter, get_iran_name),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')
+            ],
+            GET_IRAN_IP: [
+                MessageHandler(text_filter, get_iran_ip),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')
+            ],
+            GET_IRAN_PORT: [
+                MessageHandler(text_filter, get_iran_port),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')
+            ],
+            GET_IRAN_USER: [
+                MessageHandler(text_filter, get_iran_user),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')
+            ],
+            GET_IRAN_PASS: [
+                MessageHandler(text_filter, get_iran_pass),
+                CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')
+            ],
+            # --- Config States ---
+            GET_JSON_CONF: [MessageHandler(filters.TEXT | filters.Document.ALL, process_json_config)],
+            GET_SUB_LINK: [MessageHandler(filters.TEXT, process_sub_link)],
+            GET_CONFIG_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_add_config)],
+            GET_SUB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_sub_adding)],
         },
         fallbacks=[
             CommandHandler('cancel', cancel_handler_func),
@@ -3922,7 +4635,7 @@ def main():
     app.add_handler(conv_handler)
 
     # ==========================================================================
-    # 2. SECRET KEY MANAGEMENT (بازگردانی کلید امنیتی)
+    # 2. SECRET KEY MANAGEMENT
     # ==========================================================================
     key_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_key_restore_start, pattern='^admin_key_restore_start$')],
@@ -3935,30 +4648,33 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_key_backup_get, pattern='^admin_key_backup_get$'))
 
     # ==========================================================================
-    # 3. COMMAND HANDLERS (دستورات متنی)
+    # 3. COMMAND HANDLERS
     # ==========================================================================
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('dashboard', dashboard_command))
     app.add_handler(CommandHandler('setting', settings_command))
-    
-    # ==========================================================================
-    # 4. CALLBACK HANDLERS (دکمه‌های شیشه‌ای)
-    # ==========================================================================
-    
-    # --- Main Menu ---
-    app.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
-    
-    # --- Admin Panel ---
-    app.add_handler(CallbackQueryHandler(admin_panel_main, pattern='^admin_panel_main$'))
-    app.add_handler(CallbackQueryHandler(admin_users_list, pattern='^admin_users_page_'))
-    app.add_handler(CallbackQueryHandler(admin_user_manage, pattern='^admin_u_manage_'))
-    app.add_handler(CallbackQueryHandler(admin_user_actions, pattern='^admin_u_'))
-    app.add_handler(CallbackQueryHandler(admin_users_text, pattern='^admin_users_text$'))
-    app.add_handler(CallbackQueryHandler(admin_backup_get, pattern='^admin_backup_get$'))
-    
-    # --- Payment Deletion (Admin) ---
-    app.add_handler(CallbackQueryHandler(delete_payment_method_action, pattern='^del_pay_method_'))
 
+    # ==========================================================================
+    # 4. CALLBACK HANDLERS
+    # ==========================================================================
+
+    # --- Main Menu & Basics ---
+    app.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
+    app.add_handler(CallbackQueryHandler(status_dashboard, pattern='^status_dashboard$'))
+    app.add_handler(CallbackQueryHandler(dashboard_sort_menu, pattern='^dashboard_sort_menu$'))
+    app.add_handler(CallbackQueryHandler(set_dashboard_sort_action, pattern='^set_dash_sort_'))
+    # در قسمت CallbackQueryHandlers اضافه کنید:
+    app.add_handler(CallbackQueryHandler(delete_item_from_list_action, pattern='^del_list_item_'))
+    # --- Admin Panel ---
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_panel_main, pattern='^admin_panel_main$'))
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_users_list, pattern='^admin_users_page_'))
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_user_manage, pattern='^admin_u_manage_'))
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_user_actions, pattern='^admin_u_'))
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_users_text, pattern='^admin_users_text$'))
+    app.add_handler(CallbackQueryHandler(admin_backup_get, pattern='^admin_backup_get$')) # در bot.py ماند
+    
+    # --- Admin Reports ---
+    app.add_handler(CallbackQueryHandler(admin_panel.admin_all_servers_report, pattern='^admin_all_servers_'))
     # --- Server & Group Actions ---
     app.add_handler(CallbackQueryHandler(groups_menu, pattern='^groups_menu$'))
     app.add_handler(CallbackQueryHandler(delete_group_action, pattern='^delgroup_'))
@@ -3968,61 +4684,104 @@ def main():
     app.add_handler(CallbackQueryHandler(server_actions, pattern='^act_'))
     app.add_handler(CallbackQueryHandler(manage_servers_list, pattern='^manage_servers_list$'))
     app.add_handler(CallbackQueryHandler(toggle_server_active_action, pattern='^toggle_active_'))
+    app.add_handler(CallbackQueryHandler(show_server_stats, pattern='^show_server_stats$'))
+
+    # --- Tunnel Configuration ---
+    app.add_handler(CallbackQueryHandler(tunnel_list_menu, pattern='^tunnel_list_menu$'))
+    app.add_handler(CallbackQueryHandler(mass_update_test_start, pattern='^mass_update_test_all$'))
+    app.add_handler(CallbackQueryHandler(show_tunnels_by_mode, pattern='^list_mode_'))
+    app.add_handler(CallbackQueryHandler(update_all_configs_status, pattern='^update_all_tunnels$'))
+    app.add_handler(CallbackQueryHandler(test_single_config, pattern='^test_conf_'))
+    app.add_handler(CallbackQueryHandler(view_config_action, pattern='^view_conf_'))
+    app.add_handler(CallbackQueryHandler(delete_config_action, pattern='^del_conf_'))
+    app.add_handler(CallbackQueryHandler(manage_single_sub_menu, pattern='^manage_sub_'))
+    app.add_handler(CallbackQueryHandler(manual_update_sub_action, pattern='^update_sub_'))
+    app.add_handler(CallbackQueryHandler(delete_full_subscription, pattern='^del_sub_full_'))
+    
+    # --- New Config Detail Buttons ---
+    app.add_handler(CallbackQueryHandler(show_config_details, pattern='^conf_detail_'))
+    app.add_handler(CallbackQueryHandler(copy_config_action, pattern='^copy_conf_'))
+    app.add_handler(CallbackQueryHandler(qr_config_action, pattern='^qr_conf_'))
+    app.add_handler(CallbackQueryHandler(get_sub_links_action, pattern='^get_sub_links_'))
+
+    # --- Tunnel Monitoring (Iran Node) ---
+    app.add_handler(CallbackQueryHandler(monitor_settings_panel, pattern='^monitor_settings_panel$'))
+    app.add_handler(CallbackQueryHandler(delete_monitor_node, pattern='^delete_monitor_node$'))
+    app.add_handler(CallbackQueryHandler(update_monitor_node, pattern='^update_monitor_node$'))
 
     # --- Wallet, Payment & Referral ---
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern='^wallet_menu$'))
     app.add_handler(CallbackQueryHandler(referral_menu, pattern='^referral_menu$'))
     app.add_handler(CallbackQueryHandler(select_payment_method, pattern='^buy_plan_'))
     app.add_handler(CallbackQueryHandler(show_payment_details, pattern='^pay_method_'))
-    
-    # --- Admin Payment Approval ---
+    app.add_handler(CallbackQueryHandler(delete_payment_method_action, pattern='^del_pay_method_'))
     app.add_handler(CallbackQueryHandler(admin_approve_payment_action, pattern='^admin_approve_pay_'))
     app.add_handler(CallbackQueryHandler(admin_reject_payment_action, pattern='^admin_reject_pay_'))
-    
+
     # --- Global Operations ---
     app.add_handler(CallbackQueryHandler(global_ops_menu, pattern='^global_ops_menu$'))
     app.add_handler(CallbackQueryHandler(global_action_handler, pattern='^glob_act_'))
-    
+
     # --- Settings & Utilities ---
+    app.add_handler(CallbackQueryHandler(settings_menu, pattern='^settings_menu$'))
     app.add_handler(CallbackQueryHandler(set_dns_action, pattern='^setdns_'))
     app.add_handler(CallbackQueryHandler(channels_menu, pattern='^channels_menu$'))
     app.add_handler(CallbackQueryHandler(delete_channel_action, pattern='^delchan_'))
-    app.add_handler(CallbackQueryHandler(settings_menu, pattern='^settings_menu$'))
-    app.add_handler(CallbackQueryHandler(automation_settings_menu, pattern='^menu_automation$'))
-    app.add_handler(CallbackQueryHandler(monitoring_settings_menu, pattern='^menu_monitoring$'))
-    app.add_handler(CallbackQueryHandler(status_dashboard, pattern='^status_dashboard$'))
+    app.add_handler(CallbackQueryHandler(schedules_settings_menu, pattern='^menu_schedules$'))
     app.add_handler(CallbackQueryHandler(settings_cron_menu, pattern='^settings_cron$'))
     app.add_handler(CallbackQueryHandler(set_cron_action, pattern='^setcron_'))
     app.add_handler(CallbackQueryHandler(toggle_down_alert, pattern='^toggle_downalert_'))
-    app.add_handler(CallbackQueryHandler(send_instant_channel_report, pattern='^send_instant_report$'))
-    
-    
+    app.add_handler(CallbackQueryHandler(send_general_report_action, pattern='^send_general_report$'))
+
+    # --- Advanced Monitoring Settings ---
+    app.add_handler(CallbackQueryHandler(advanced_monitoring_settings, pattern='^advanced_monitoring_settings$'))
+    app.add_handler(CallbackQueryHandler(set_small_size_menu, pattern='^set_small_size_menu$'))
+    app.add_handler(CallbackQueryHandler(set_big_size_menu, pattern='^set_big_size_menu$'))
+    app.add_handler(CallbackQueryHandler(set_big_interval_menu, pattern='^set_big_interval_menu$'))
+    app.add_handler(CallbackQueryHandler(save_setting_action, pattern='^save_'))
+
     # --- Auto Schedule Settings ---
     app.add_handler(CallbackQueryHandler(auto_update_menu, pattern='^auto_up_menu$'))
     app.add_handler(CallbackQueryHandler(save_auto_schedule, pattern='^set_autoup_'))
     app.add_handler(CallbackQueryHandler(save_auto_reboot_final, pattern='^(savereb_|disable_reboot)'))
-    
-    # ==========================================================================
-    # 5. JOB QUEUE (وظایف زمان‌بندی شده)
+    app.add_handler(CallbackQueryHandler(show_add_service_menu, pattern='^open_add_menu$'))
+    app.add_handler(CallbackQueryHandler(show_lists_menu, pattern='^open_lists_menu$'))
+    app.add_handler(CallbackQueryHandler(show_account_menu, pattern='^open_account_menu$'))
+    app.add_handler(CallbackQueryHandler(refresh_conf_dash_action, pattern='^refresh_conf_dash_ping$'))
+# ==========================================================================
+    # 5. JOB QUEUE (وظایف زمان‌بندی شده از ماژول cronjobs)
     # ==========================================================================
     if app.job_queue:
-        # بررسی انقضا سرورها (هر روز ساعت 8:30 صبح)
-        app.job_queue.run_daily(check_expiry_job, time=dt.time(hour=8, minute=30, second=0))
-        # مانیتورینگ اصلی (هر 40 ثانیه)
-        app.job_queue.run_repeating(global_monitor_job, interval=DEFAULT_INTERVAL, first=10)
-        # جاب اسکژولر برای آپدیت و ریبوت خودکار (هر دقیقه)
-        app.job_queue.run_repeating(auto_scheduler_job, interval=60, first=20)
-        # وایت‌لیست کردن آی‌پی ربات در شروع (یکبار)
-        app.job_queue.run_once(startup_whitelist_job, when=10)
-        # 👇👇 (بکاپ ساعتی هر 1 ساعت) 👇👇
-        app.job_queue.run_repeating(auto_backup_send_job, interval=3600, first=300)
-        # بررسی انقضای پاداش رفرال (هر 12 ساعت)
-        app.job_queue.run_repeating(check_bonus_expiry_job, interval=43200, first=60)
+        # --- Startup ---
+        # (خطوط تکراری حذف شدند تا پیام دوبله نیاید)
+        app.job_queue.run_once(cronjobs.system_startup_notification, when=2)
+        app.job_queue.run_once(cronjobs.startup_whitelist_job, when=15)
+        app.job_queue.run_once(cronjobs.send_startup_topic_test, when=10)
+        
+        # --- Daily ---
+        app.job_queue.run_daily(cronjobs.check_expiry_job, time=dt.time(hour=8, minute=30, second=0))
+
+        # --- Recurring ---
+        app.job_queue.run_repeating(cronjobs.auto_scheduler_job, interval=120, first=30)
+        
+        # مانیتورینگ سرورها: هر ۶۰ ثانیه (۱ دقیقه)
+        app.job_queue.run_repeating(cronjobs.global_monitor_job, interval=60, first=10)
+        
+        # مانیتورینگ کانفیگ‌ها: هر ۶۰ ثانیه (۱ دقیقه)
+        app.job_queue.run_repeating(cronjobs.monitor_tunnels_job, interval=60, first=20)
+        
+        # آپدیت ساب‌ها: هر ۱۲ ساعت
+        app.job_queue.run_repeating(cronjobs.auto_update_subs_job, interval=43200, first=3600)
+
+        app.job_queue.run_repeating(cronjobs.auto_backup_send_job, interval=3600, first=300)
+        app.job_queue.run_repeating(cronjobs.check_bonus_expiry_job, interval=43200, first=600)
+
     else:
-        logger.error("JobQueue not available. Install python-telegram-bot[job-queue]")
-    
-    # اجرای ربات
+        logger.error("JobQueue not available.")
+
+    # اجرا
     app.run_polling(drop_pending_updates=True, close_loop=False)
+
 
 if __name__ == '__main__':
     main()
