@@ -4437,6 +4437,183 @@ async def run_quick_ping_check(context, uid, configs, monitor):
                     cur.execute("UPDATE tunnel_configs SET last_status='Fail' WHERE id=?", (cid,))
             conn.commit()
 # ==============================================================================
+# 🧩 MISSING FUNCTIONS (توابع گم‌شده)
+# ==============================================================================
+
+async def manual_ping_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع پینگ دستی"""
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text(
+        "🌐 **آدرس مورد نظر (IP یا دامنه) را ارسال کنید:**", 
+        reply_markup=keyboard.get_cancel_markup()
+    )
+    return GET_MANUAL_HOST
+
+async def perform_manual_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اجرای پینگ دستی"""
+    target = update.message.text
+    msg = await update.message.reply_text(f"⏳ **در حال تست پینگ {target}...**")
+    loop = asyncio.get_running_loop()
+    # استفاده از API چک هاست که در core موجود است
+    ok, data = await loop.run_in_executor(None, ServerMonitor.check_host_api, target)
+    if ok:
+        # استفاده از فرمت‌دهی موجود در StatsManager
+        res = StatsManager.format_check_host_results(data)
+        await msg.edit_text(res, parse_mode='Markdown')
+    else:
+        await msg.edit_text(f"❌ خطا در دریافت اطلاعات: {data}")
+    return ConversationHandler.END
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی تنظیمات"""
+    if update.callback_query: await update.callback_query.answer()
+    reply_markup = keyboard.settings_main_kb()
+    await safe_edit_message(update, "⚙️ **تنظیمات پیشرفته:**", reply_markup=reply_markup)
+
+async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی کیف پول"""
+    if update.callback_query: await update.callback_query.answer()
+    reply_markup = keyboard.wallet_main_kb()
+    await safe_edit_message(update, "💳 **کیف پول و خرید اشتراک:**", reply_markup=reply_markup)
+
+async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """انتخاب روش پرداخت"""
+    plan_key = update.callback_query.data.split('_')[2]
+    context.user_data['selected_plan'] = plan_key
+    reply_markup = keyboard.payment_method_kb()
+    await safe_edit_message(update, "💳 لطفاً روش پرداخت را انتخاب کنید:", reply_markup=reply_markup)
+
+async def channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت کانال‌ها"""
+    if update.callback_query: await update.callback_query.answer()
+    channels = db.get_user_channels(update.effective_user.id)
+    kb = []
+    for ch in channels:
+        kb.append([InlineKeyboardButton(f"🗑 حذف: {ch['name']}", callback_data=f"delchan_{ch['id']}")])
+    kb.append([InlineKeyboardButton("➕ افزودن کانال جدید", callback_data='add_channel')])
+    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')])
+    await safe_edit_message(update, "📢 **مدیریت کانال‌های متصل:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def schedules_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی زمان‌بندی‌ها"""
+    if update.callback_query: await update.callback_query.answer()
+    uid = update.effective_user.id
+    # دریافت تنظیمات فعلی برای نمایش تیک
+    srv_alert = "✅" if db.get_setting(uid, 'down_alert_enabled') == '1' else "❌"
+    conf_alert = "✅" if (db.get_setting(uid, 'config_alert_enabled') or '1') == '1' else "❌"
+    
+    # مقادیر toggle (برای دکمه بعدی)
+    srv_toggle = '0' if srv_alert == "✅" else '1'
+    conf_toggle = '0' if conf_alert == "✅" else '1'
+    
+    reply_markup = keyboard.schedules_settings_kb(srv_alert, srv_toggle, conf_alert, conf_toggle)
+    await safe_edit_message(update, "⏰ **تنظیمات زمان‌بندی و هشدارها:**", reply_markup=reply_markup)
+
+async def settings_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی زمان‌بندی گزارش سرور"""
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'report_interval') or '0'
+    reply_markup = keyboard.settings_cron_kb(curr)
+    await safe_edit_message(update, "📊 **زمان‌بندی گزارش وضعیت سرورها:**", reply_markup=reply_markup)
+
+async def config_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی زمان‌بندی گزارش کانفیگ"""
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'config_report_interval') or '60'
+    reply_markup = keyboard.config_cron_kb(curr)
+    await safe_edit_message(update, "📡 **زمان‌بندی گزارش وضعیت کانفیگ‌ها:**", reply_markup=reply_markup)
+
+async def toggle_config_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تغییر وضعیت هشدار کانفیگ"""
+    state = update.callback_query.data.split('_')[2]
+    db.set_setting(update.effective_user.id, 'config_alert_enabled', state)
+    await schedules_settings_menu(update, context)
+
+async def send_general_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال گزارش کلی دستی"""
+    await update.callback_query.answer("⏳ در حال تولید گزارش...")
+    await cronjobs.global_monitor_job(context) # اجرای دستی جاب
+    await update.callback_query.message.reply_text("✅ گزارش کلی به کانال‌های تنظیم شده ارسال شد.")
+
+async def manage_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لیست مدیریت خاموش/روشن کردن مانیتورینگ"""
+    servers = db.get_all_user_servers(update.effective_user.id)
+    reply_markup = keyboard.manage_monitor_list_kb(servers)
+    await safe_edit_message(update, "⚡️ **برای تغییر وضعیت مانیتورینگ روی سرور بزنید:**", reply_markup=reply_markup)
+
+async def toggle_server_active_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تغییر وضعیت فعال/غیرفعال سرور"""
+    sid = int(update.callback_query.data.split('_')[2])
+    srv = db.get_server_by_id(sid)
+    if srv:
+        new_state = db.toggle_server_active(sid, srv['is_active'])
+        state_str = "غیرفعال 🔴" if new_state == 0 else "فعال 🟢"
+        await update.callback_query.answer(f"سرور {srv['name']} {state_str} شد.")
+        await manage_servers_list(update, context)
+
+async def header_none_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """برای دکمه‌های هدر که عملی ندارند"""
+    await update.callback_query.answer()
+
+async def config_stats_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """داشبورد وضعیت کانفیگ‌ها"""
+    if update.callback_query: await update.callback_query.answer()
+    
+    uid = update.effective_user.id
+    # آمار کلی
+    with db.get_connection() as (conn, cur):
+        total = cur.execute("SELECT COUNT(*) FROM tunnel_configs WHERE owner_id=?", (uid,)).fetchone()[0]
+        active = cur.execute("SELECT COUNT(*) FROM tunnel_configs WHERE owner_id=? AND last_status='OK'", (uid,)).fetchone()[0]
+        subs = cur.execute("SELECT COUNT(*) FROM tunnel_configs WHERE owner_id=? AND type='sub_source'", (uid,)).fetchone()[0]
+
+    inactive = total - active - subs # ساب‌ها را از کل کم می‌کنیم چون وضعیتشان مهم نیست
+    
+    txt = (
+        f"📡 **وضعیت شبکه و کانفیگ‌ها**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📦 تعداد سابسکریپشن: `{subs}`\n"
+        f"👤 کانفیگ‌های تکی و آیتم‌ها: `{total - subs}`\n\n"
+        f"✅ **آنلاین:** `{active}`\n"
+        f"🔴 **آفلاین:** `{inactive}`"
+    )
+    
+    kb = [
+        [InlineKeyboardButton("🔄 تست پینگ همگانی (Fast)", callback_data='refresh_conf_dash_ping')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')]
+    ]
+    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def set_dns_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تنظیم DNS سرور"""
+    query = update.callback_query
+    parts = query.data.split('_')
+    dns_type = parts[1]
+    sid = parts[2]
+    
+    srv = db.get_server_by_id(sid)
+    if not srv:
+        await query.answer("❌ سرور یافت نشد.")
+        return
+
+    await query.message.reply_text(f"⚙️ **در حال تنظیم DNS {dns_type} روی سرور...**")
+    
+    real_pass = sec.decrypt(srv['password'])
+    loop = asyncio.get_running_loop()
+    
+    ok, msg = await loop.run_in_executor(None, ServerMonitor.set_dns, srv['ip'], srv['port'], srv['username'], real_pass, dns_type)
+    
+    if ok:
+        await query.message.reply_text("✅ **DNS با موفقیت تغییر کرد.**")
+    else:
+        await query.message.reply_text(f"❌ خطا در تغییر DNS:\n{msg}")
+    
+    await server_detail(update, context, custom_sid=sid)
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور /setting"""
+    await settings_menu(update, context)
+
+# ==============================================================================
 # END OF MISSING FUNCTIONS
 # ==============================================================================
 def main():
