@@ -4672,7 +4672,7 @@ def main():
             # --- User & Reports ---
             CallbackQueryHandler(user_profile_menu, pattern='^user_profile$'),
             CallbackQueryHandler(web_token_action, pattern='^gen_web_token$'),
-            CallbackQueryHandler(send_global_full_report_action, pattern='^act_global_full_report$'),
+            CallbackQueryHandler(send_general_report_action, pattern='^act_global_full_report$'),
 
             # --- Auto Reboot ---
             CallbackQueryHandler(ask_reboot_time, pattern='^start_set_reboot$'),
