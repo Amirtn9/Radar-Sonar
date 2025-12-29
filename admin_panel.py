@@ -11,9 +11,10 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 # --- Local Modules ---
 import keyboard
+from states import *
 from database import Database
 from settings import SUPER_ADMIN_ID, KEY_FILE
-from core import ServerMonitor, get_jalali_str, get_tehran_datetime
+from core import ServerMonitor, get_jalali_str, get_tehran_datetime, sec
 from server_stats import StatsManager
 # ایمپورت موتور امتیازدهی
 from scoring import ScoreEngine
@@ -21,40 +22,15 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger(__name__)
 db = Database()
-
-# --- Security Setup (برای دیکریپت پسوردها در گزارش‌ها) ---
-class Security:
-    def __init__(self):
-        if not os.path.exists(KEY_FILE):
-            with open(KEY_FILE, 'wb') as f: f.write(Fernet.generate_key())
-        with open(KEY_FILE, 'rb') as f: self.key = f.read()
-        self.cipher = Fernet(self.key)
-    def decrypt(self, txt):
-        try: return self.cipher.decrypt(txt.encode()).decode()
-        except: return ""
-sec = Security()
-
-# --- تعریف ثابت‌های State (باید با bot.py هماهنگ باشند) ---
-# این اعداد همان‌هایی هستند که در bot.py تعریف شده‌اند
-ADD_ADMIN_ID, ADD_ADMIN_DAYS, ADMIN_SEARCH_USER, \
-ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_RESTORE_KEY, ADMIN_SET_TIME_MANUAL, \
-GET_CUSTOM_INTERVAL, GET_EXPIRY, GET_CHANNEL_TYPE, \
-EDIT_SERVER_EXPIRY, GET_REMOTE_COMMAND, \
-GET_CPU_LIMIT, GET_RAM_LIMIT, GET_DISK_LIMIT, \
-GET_BROADCAST_MSG, GET_REBOOT_TIME, \
-ADD_PAY_TYPE, ADD_PAY_NET, ADD_PAY_ADDR, ADD_PAY_HOLDER = range(9, 30)
-
-ADMIN_GET_UID_FOR_REPORT = range(300)[0] # این هم در bot.py تعریف شده بود
-
-# --- Helper Function ---
 async def safe_edit_message(update: Update, text, reply_markup=None, parse_mode='Markdown'):
     try:
         if update.callback_query:
-            await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return await update.callback_query.edit_message_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
         elif update.message:
-            await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return await update.message.reply_text(text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception:
         pass
+    return None
 
 # ==============================================================================
 # 👑 ADMIN PANEL HANDLERS
@@ -63,8 +39,11 @@ async def safe_edit_message(update: Update, text, reply_markup=None, parse_mode=
 async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID: return
     users_count = len(db.get_all_users())
-    with db.get_connection() as conn:
-        total_servers = len(conn.execute('SELECT id FROM servers').fetchall())
+    
+    # 👇 اصلاح شد: باز کردن صحیح کانکشن و نشانگر
+    with db.get_connection() as (conn, cur):
+        cur.execute('SELECT id FROM servers')
+        total_servers = len(cur.fetchall())
 
     reply_markup = keyboard.admin_main_kb()
     txt = (
@@ -302,7 +281,7 @@ async def admin_full_report_global_action(update: Update, context: ContextTypes.
 
 async def run_full_global_report(context, chat_id):
     loop = asyncio.get_running_loop()
-    all_servers = await loop.run_in_executor(None, db.get_all_servers)
+    all_servers = await loop.run_in_executor(EXECUTOR, db.get_all_servers)
     active_servers = [s for s in all_servers if s['is_active']]
 
     if not active_servers:
@@ -312,7 +291,7 @@ async def run_full_global_report(context, chat_id):
     sem = asyncio.Semaphore(10)
     async def safe_check(s):
         async with sem:
-            return await loop.run_in_executor(None, StatsManager.check_full_stats, s['ip'], s['port'], s['username'], sec.decrypt(s['password']))
+            return await loop.run_in_executor(EXECUTOR, StatsManager.check_full_stats, s['ip'], s['port'], s['username'], sec.decrypt(s['password']))
 
     results = await asyncio.gather(*[safe_check(s) for s in active_servers], return_exceptions=True)
     report_lines = []

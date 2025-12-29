@@ -1,6 +1,9 @@
-python-telegram-bot[job-queue]
-requests
+python-telegram-bot[job-queue]==20.8
 paramiko
 cryptography
-matplotlib
 jdatetime
+matplotlib
+requests
+psycopg2-binary
+websockets
+psutil

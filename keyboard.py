@@ -766,3 +766,25 @@ def admin_global_report_kb(page, total_pages):
         kb.append(nav_row)
     kb.append([InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data='admin_panel_main')])
     return InlineKeyboardMarkup(kb)
+
+# ------------------ Admin: Logs & Services ------------------
+
+def admin_logs_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🦇 لاگ BOT", callback_data="admin_log_bot"),
+         InlineKeyboardButton("🦇 لاگ API", callback_data="admin_log_api")],
+        [InlineKeyboardButton("🦇 لاگ AGENT", callback_data="admin_log_agent"),
+         InlineKeyboardButton("🦇 لاگ PostgreSQL", callback_data="admin_log_postgres")],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_panel_main")]
+    ])
+
+def admin_services_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 ریستارت BOT", callback_data="svc_restart_bot"),
+         InlineKeyboardButton("ℹ️ وضعیت BOT", callback_data="svc_status_bot")],
+        [InlineKeyboardButton("🔄 ریستارت API", callback_data="svc_restart_api"),
+         InlineKeyboardButton("ℹ️ وضعیت API", callback_data="svc_status_api")],
+        [InlineKeyboardButton("🔄 ریستارت AGENT", callback_data="svc_restart_agent"),
+         InlineKeyboardButton("ℹ️ وضعیت AGENT", callback_data="svc_status_agent")],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="admin_panel_main")]
+    ])
