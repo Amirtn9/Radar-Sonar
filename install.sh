@@ -7,6 +7,7 @@ set -Eeuo pipefail
 # - 0->100 automated
 # - PostgreSQL only
 # - Always uses /opt/radar-sonar/.venv for systemd ExecStart
+# - Error-free installation with comprehensive error handling
 # ==============================================================================
 
 # --- Configuration ---
@@ -22,6 +23,7 @@ KEY_FILE="secret.key"
 CONFIG_FILE="sonar_config.json"
 SETTINGS_FILE="settings.py"
 LOG_FILE="/var/log/sonar_install.log"
+LOCK_FILE="/var/run/sonar-bot.lock"
 
 # PostgreSQL Defaults
 DB_NAME="sonar_ultra_pro"
@@ -45,10 +47,13 @@ if [ "${EUID}" -ne 0 ]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$LOG_FILE")" >/dev/null 2>&1 || true
-touch "$LOG_FILE" >/dev/null 2>&1 || true
+# Ensure log directory exists
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
 
-function log_msg() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"; }
+function log_msg() { 
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
+}
 
 function print_title() {
   clear
@@ -56,19 +61,34 @@ function print_title() {
   echo "      /\\                /\\    "
   echo "     / \\'._   (\\_/)   _.'/ \\   "
   echo "    /_.''._'--('.')--'_.''._\\  "
-  echo "    | \\_ / \\`  ~ ~  \\`/ \\_ / |  "
-  echo "     \\_/  \\`/       \\`'  \\_/   "
-  echo "           \\`           \\`      "
+  echo "    | \\_ / \\\`  ~ ~  \\\`/ \\_ / |  "
+  echo "     \\_/  \\\`/       \\\`'  \\_/   "
+  echo "           \\\`           \\\`      "
   echo -e "${RESET}"
   echo -e "   ${CYAN}${BOLD}🦇 SONAR RADAR ULTRA MONITOR${RESET}"
   echo -e "   ${BLUE}──────────────────────────────────${RESET}"
   echo ""
 }
 
-function print_success() { echo -e "${GREEN}${BOLD}✅ $1${RESET}"; log_msg "SUCCESS: $1"; }
-function print_error()   { echo -e "${RED}${BOLD}❌ $1${RESET}"; log_msg "ERROR: $1"; }
-function print_info()    { echo -e "${YELLOW}➤ ${RESET}$1..."; log_msg "INFO: $1"; }
-function warn_msg()      { echo -e "${YELLOW}${BOLD}⚠️  $1${RESET}"; log_msg "WARN: $1"; }
+function print_success() { 
+  echo -e "${GREEN}${BOLD}✅ $1${RESET}"
+  log_msg "SUCCESS: $1"
+}
+
+function print_error() { 
+  echo -e "${RED}${BOLD}❌ $1${RESET}"
+  log_msg "ERROR: $1"
+}
+
+function print_info() { 
+  echo -e "${YELLOW}➤ ${RESET}$1..."
+  log_msg "INFO: $1"
+}
+
+function warn_msg() { 
+  echo -e "${YELLOW}${BOLD}⚠️  $1${RESET}"
+  log_msg "WARN: $1"
+}
 
 function wait_enter() {
   echo ""
@@ -111,7 +131,7 @@ function progress_bar() {
 function read_json_val() {
   local file=$1 key=$2
   if [ -f "$file" ]; then
-    python3 -c "import json; print(json.load(open('$file')).get('$key',''))" 2>/dev/null || true
+    python3 -c "import json; print(json.load(open('$file')).get('$key',''))" 2>/dev/null || echo ""
   else
     echo ""
   fi
@@ -128,46 +148,133 @@ function update_settings_py() {
   fi
 }
 
-function port_in_use() { ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${1}$"; }
+function port_in_use() { 
+  ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${1}$" 2>/dev/null || false
+}
 
 function find_free_port() {
   local start="$1"
   local p="$start"
   for _ in $(seq 1 80); do
-    if port_in_use "$p"; then p=$((p+1)); else echo "$p"; return 0; fi
+    if port_in_use "$p"; then 
+      p=$((p+1))
+    else 
+      echo "$p"
+      return 0
+    fi
   done
   echo "$start"
 }
 
+function kill_zombie_processes() {
+  print_info "Cleaning up zombie processes and stale locks"
+  
+  # Kill any running bot processes
+  pkill -f "$INSTALL_DIR/bot.py" 2>/dev/null || true
+  pkill -f "sonar-bot" 2>/dev/null || true
+  sleep 2
+  
+  # Remove stale lock file if no process is using it
+  if [ -f "$LOCK_FILE" ]; then
+    # Check if any process is actually using the lock
+    local lock_pid
+    lock_pid=$(lsof -t "$LOCK_FILE" 2>/dev/null || true)
+    if [ -z "$lock_pid" ]; then
+      # No process using it - remove stale lock
+      rm -f "$LOCK_FILE" 2>/dev/null || true
+      log_msg "Removed stale lock file"
+    else
+      # Process exists - kill it
+      kill -9 "$lock_pid" 2>/dev/null || true
+      sleep 1
+      rm -f "$LOCK_FILE" 2>/dev/null || true
+      log_msg "Killed process holding lock and removed lock file"
+    fi
+  fi
+  
+  # Also check /run/sonar-bot.lock (old path)
+  if [ -f "/run/sonar-bot.lock" ]; then
+    local old_lock_pid
+    old_lock_pid=$(lsof -t "/run/sonar-bot.lock" 2>/dev/null || true)
+    if [ -z "$old_lock_pid" ]; then
+      rm -f "/run/sonar-bot.lock" 2>/dev/null || true
+    else
+      kill -9 "$old_lock_pid" 2>/dev/null || true
+      sleep 1
+      rm -f "/run/sonar-bot.lock" 2>/dev/null || true
+    fi
+  fi
+}
+
 function install_system_deps() {
   print_info "Installing System Dependencies"
-  apt-get update -y >/dev/null 2>&1 &
-  show_loading $! "Updating repositories..."
-  # NOTE: rsync for safe copy, ufw for firewall, lsof/ss tools exist in iproute2
+  
+  # Update repositories with error handling
+  if ! apt-get update -y >/dev/null 2>&1; then
+    warn_msg "apt-get update had warnings, continuing..."
+  fi
+  
+  # Install dependencies
   local DEPS="python3 python3-pip python3-venv git curl ca-certificates rsync unzip \
 build-essential libssl-dev libffi-dev python3-dev \
-postgresql postgresql-contrib libpq-dev bc ufw iproute2"
-  apt-get install -y $DEPS >/dev/null 2>&1 &
-  show_loading $! "Installing packages..."
+postgresql postgresql-contrib libpq-dev bc ufw iproute2 lsof"
+  
+  if ! apt-get install -y $DEPS >/dev/null 2>&1; then
+    print_error "Some packages failed to install. Continuing anyway..."
+  fi
+  
+  print_success "System dependencies installed"
 }
 
 function setup_postgres() {
   print_info "Configuring PostgreSQL Database"
+  
+  # Start PostgreSQL
   systemctl start postgresql >/dev/null 2>&1 || true
   systemctl enable postgresql >/dev/null 2>&1 || true
-
-  # Avoid “could not change directory” by running from /
+  sleep 2
+  
+  # Wait for PostgreSQL to be ready
+  local retries=0
+  while [ $retries -lt 10 ]; do
+    if sudo -u postgres psql -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+    retries=$((retries + 1))
+  done
+  
+  if [ $retries -eq 10 ]; then
+    print_error "PostgreSQL not responding after 10 seconds"
+    return 1
+  fi
+  
+  # Create user if not exists
   ( cd / || true
-    sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1 || \
-      sudo -u postgres psql -d postgres -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" >/dev/null 2>&1
-
-    sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1 || \
-      sudo -u postgres psql -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};" >/dev/null 2>&1
-
-    sudo -u postgres psql -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null 2>&1
-  ) || true
-
-  print_success "PostgreSQL Database Ready."
+    if ! sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" 2>/dev/null | grep -q 1; then
+      sudo -u postgres psql -d postgres -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASS}';" >/dev/null 2>&1 || {
+        print_error "Failed to create PostgreSQL user"
+        return 1
+      }
+    fi
+    
+    # Create database if not exists
+    if ! sudo -u postgres psql -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" 2>/dev/null | grep -q 1; then
+      sudo -u postgres psql -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};" >/dev/null 2>&1 || {
+        print_error "Failed to create PostgreSQL database"
+        return 1
+      }
+    fi
+    
+    # Grant privileges
+    sudo -u postgres psql -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};" >/dev/null 2>&1 || true
+  ) || {
+    print_error "PostgreSQL setup failed"
+    return 1
+  }
+  
+  print_success "PostgreSQL Database Ready"
+  return 0
 }
 
 function backup_install_dir() {
@@ -176,7 +283,10 @@ function backup_install_dir() {
     ts="$(date +%F-%H%M%S)"
     bak="${INSTALL_DIR}.bak.${ts}"
     print_info "Backing up existing installation to $bak"
-    mv "$INSTALL_DIR" "$bak"
+    mv "$INSTALL_DIR" "$bak" 2>/dev/null || {
+      print_error "Failed to backup existing installation"
+      return 1
+    }
     echo "$bak"
   else
     echo ""
@@ -184,25 +294,33 @@ function backup_install_dir() {
 }
 
 function ensure_clean_install_dir() {
-  rm -rf "$INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
+  rm -rf "$INSTALL_DIR" 2>/dev/null || true
+  mkdir -p "$INSTALL_DIR" 2>/dev/null || {
+    print_error "Failed to create installation directory"
+    return 1
+  }
 }
 
 function clone_repo_to_install_dir() {
   print_info "Cloning from GitHub (${REPO_URL})"
-  git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1 || return 1
+  
+  # Remove existing directory if clone fails
+  if ! git clone --depth 1 --branch "$REPO_BRANCH" "$REPO_URL" "$INSTALL_DIR" >/dev/null 2>&1; then
+    rm -rf "$INSTALL_DIR" 2>/dev/null || true
+    print_error "Git clone failed. Check network/DNS/GitHub access."
+    return 1
+  fi
+  
   return 0
 }
 
 function verify_repo_files() {
   if [ ! -f "$INSTALL_DIR/bot.py" ]; then
     print_error "bot.py not found in $INSTALL_DIR (clone looks incomplete)."
-    ls -lah "$INSTALL_DIR" || true
     return 1
   fi
   if [ ! -f "$INSTALL_DIR/requirements.txt" ]; then
     print_error "requirements.txt not found in $INSTALL_DIR."
-    ls -lah "$INSTALL_DIR" || true
     return 1
   fi
   return 0
@@ -210,48 +328,79 @@ function verify_repo_files() {
 
 function setup_venv_and_pip() {
   print_info "Setting up Python Virtual Environment (.venv)"
+  
   rm -rf "$INSTALL_DIR/.venv" >/dev/null 2>&1 || true
-  python3 -m venv "$INSTALL_DIR/.venv" >/dev/null 2>&1 || { print_error "venv creation failed"; return 1; }
-
-  # shellcheck disable=SC1091
-  source "$INSTALL_DIR/.venv/bin/activate" >/dev/null 2>&1 || { print_error "venv activate failed"; return 1; }
-
+  
+  if ! python3 -m venv "$INSTALL_DIR/.venv" >/dev/null 2>&1; then
+    print_error "venv creation failed"
+    return 1
+  fi
+  
+  # Activate venv
+  if ! source "$INSTALL_DIR/.venv/bin/activate" >/dev/null 2>&1; then
+    print_error "venv activate failed"
+    return 1
+  fi
+  
   print_info "Upgrading pip"
   pip install --upgrade pip setuptools wheel >/dev/null 2>&1 || true
-
+  
   print_info "Installing Python Libraries (requirements.txt)"
-  pip install -r "$INSTALL_DIR/requirements.txt" >/dev/null 2>&1 &
-  show_loading $! "Pip installing modules..."
-
-  # Ensure critical packages (prevents JobQueue + requests/psycopg2 missing)
+  if ! pip install -r "$INSTALL_DIR/requirements.txt" >/dev/null 2>&1; then
+    warn_msg "Some packages from requirements.txt failed, trying critical packages..."
+  fi
+  
+  # Ensure critical packages
   print_info "Ensuring critical packages"
-  pip install -U requests psycopg2-binary "python-telegram-bot[job-queue]" websockets psutil APScheduler tzlocal >/dev/null 2>&1 || true
-
-  python -c "import requests, psycopg2; import telegram; print('OK')" >/dev/null 2>&1 || {
-    print_error "Python import healthcheck failed (requests/telegram/psycopg2)."
+  pip install -U requests psycopg2-binary "python-telegram-bot[job-queue]" websockets psutil APScheduler tzlocal >/dev/null 2>&1 || {
+    print_error "Critical packages installation failed"
     deactivate >/dev/null 2>&1 || true
     return 1
   }
-
+  
+  # Health check
+  if ! python -c "import requests, psycopg2; import telegram; print('OK')" >/dev/null 2>&1; then
+    print_error "Python import healthcheck failed (requests/telegram/psycopg2)."
+    deactivate >/dev/null 2>&1 || true
+    return 1
+  fi
+  
   deactivate >/dev/null 2>&1 || true
+  print_success "Python environment ready"
   return 0
 }
 
 function write_service_file() {
   print_info "Configuring Systemd Service ($SERVICE_NAME)"
-
-  cat > "$INSTALL_DIR/run_bot.sh" <<EOF
+  
+  # Ensure lock directory exists
+  mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+  
+  cat > "$INSTALL_DIR/run_bot.sh" <<'RUNBOTEOF'
 #!/usr/bin/env bash
 set -euo pipefail
-APP_DIR="$INSTALL_DIR"
-PY="\$APP_DIR/.venv/bin/python"
+APP_DIR="/opt/radar-sonar"
+PY="$APP_DIR/.venv/bin/python"
 LOCK="/var/run/sonar-bot.lock"
 export PYTHONUNBUFFERED=1
-exec /usr/bin/flock -n "\$LOCK" "\$PY" "\$APP_DIR/bot.py"
-EOF
-  chmod +x "$INSTALL_DIR/run_bot.sh" >/dev/null 2>&1 || true
 
-  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+# Clean up stale lock if no process is using it
+if [ -f "$LOCK" ]; then
+  LOCK_PID=$(lsof -t "$LOCK" 2>/dev/null || echo "")
+  if [ -z "$LOCK_PID" ]; then
+    rm -f "$LOCK" 2>/dev/null || true
+  elif ! ps -p "$LOCK_PID" >/dev/null 2>&1; then
+    rm -f "$LOCK" 2>/dev/null || true
+  fi
+fi
+
+# Use flock to prevent multiple instances
+exec /usr/bin/flock -n "$LOCK" "$PY" "$APP_DIR/bot.py"
+RUNBOTEOF
+  
+  chmod +x "$INSTALL_DIR/run_bot.sh" 2>/dev/null || true
+  
+  cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SERVICEEOF
 [Unit]
 Description=Sonar Radar Bot
 After=network-online.target postgresql.service
@@ -263,7 +412,7 @@ User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/run_bot.sh
 Restart=always
-RestartSec=5
+RestartSec=10
 TimeoutStartSec=60
 TimeoutStopSec=30
 StandardOutput=journal
@@ -271,72 +420,87 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload >/dev/null 2>&1
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+SERVICEEOF
+  
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  
+  print_success "Service configured"
 }
 
 function configure_token_interactive() {
   print_title
   echo -e "${BOLD}⚙️  SETUP CONFIGURATION${RESET}\n"
-
+  
   echo -e "${CYAN}🤖 Enter Telegram Bot Token:${RESET}"
-  read -r -p ">> " TOKEN_INPUT
-
+  read -r -p ">> " TOKEN_INPUT || TOKEN_INPUT=""
+  
   echo -e "\n${CYAN}👤 Enter Admin Numeric ID:${RESET}"
-  read -r -p ">> " ADMIN_INPUT
-
+  read -r -p ">> " ADMIN_INPUT || ADMIN_INPUT=""
+  
   echo -e "\n${CYAN}🔌 Enter Agent WebSocket Port (Default: 8080):${RESET}"
-  read -r -p ">> " PORT_INPUT
+  read -r -p ">> " PORT_INPUT || PORT_INPUT=""
   PORT_INPUT=${PORT_INPUT:-8080}
-
+  
   if port_in_use "$PORT_INPUT"; then
     local NEW_PORT
     NEW_PORT="$(find_free_port "$PORT_INPUT")"
     echo -e "${YELLOW}Port $PORT_INPUT is in use. Suggested: $NEW_PORT${RESET}"
-    read -r -p "Use suggested port $NEW_PORT? [Y/n]: " yn
+    read -r -p "Use suggested port $NEW_PORT? [Y/n]: " yn || yn="Y"
     yn=${yn:-Y}
     if [[ "$yn" =~ ^[Yy]$ ]]; then
       PORT_INPUT="$NEW_PORT"
     fi
   fi
-
+  
   if [ -n "${TOKEN_INPUT:-}" ] && [ -n "${ADMIN_INPUT:-}" ]; then
-    echo "{\"bot_token\":\"$TOKEN_INPUT\",\"admin_id\":\"$ADMIN_INPUT\",\"agent_port\":$PORT_INPUT,\"ws_pool_max\":5,\"ws_ping_interval\":20,\"ws_ping_timeout\":20}" > "$INSTALL_DIR/$CONFIG_FILE"
+    echo "{\"bot_token\":\"$TOKEN_INPUT\",\"admin_id\":\"$ADMIN_INPUT\",\"agent_port\":$PORT_INPUT,\"ws_pool_max\":5,\"ws_ping_interval\":20,\"ws_ping_timeout\":20}" > "$INSTALL_DIR/$CONFIG_FILE" 2>/dev/null || {
+      print_error "Failed to write config file"
+      return 1
+    }
     update_settings_py "$ADMIN_INPUT"
     print_success "Configuration Saved! Agent Port: $PORT_INPUT"
-
+    
     print_info "Opening port $PORT_INPUT in firewall (best-effort)"
     ufw allow "${PORT_INPUT}/tcp" >/dev/null 2>&1 || true
     iptables -I INPUT -p tcp --dport "$PORT_INPUT" -j ACCEPT >/dev/null 2>&1 || true
+    return 0
   else
     print_error "Invalid input. Configuration failed."
+    return 1
   fi
 }
 
 function install_process() {
   local KEEP_CONFIG=$1
-
+  
   print_title
   echo -e "${BOLD}🚀 INITIALIZING INSTALLATION PROCESS...${RESET}\n"
   log_msg "Installation started. Keep Config: $KEEP_CONFIG"
-
-  # Stop service first
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
+  
+  # Clean up zombie processes and stale locks FIRST
+  kill_zombie_processes
+  
+  # Stop service
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     print_info "Stopping active service"
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    sleep 2
   fi
-
+  
+  # Kill any remaining processes
+  pkill -f "$INSTALL_DIR/bot.py" >/dev/null 2>&1 || true
+  sleep 1
+  
   # Backup keys + config
   local OLD_TOKEN="" OLD_ADMIN="" OLD_PORT="8080" OLD_WS_POOL="5" OLD_WS_PING_INTERVAL="20" OLD_WS_PING_TIMEOUT="20"
   local BACKUP_DIR=""
   BACKUP_DIR="$(backup_install_dir)"
-
+  
   if [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/$KEY_FILE" ]; then
     cp -a "$BACKUP_DIR/$KEY_FILE" /tmp/sonar_key.bak >/dev/null 2>&1 || true
   fi
-
+  
   if [ "$KEEP_CONFIG" = true ] && [ -n "$BACKUP_DIR" ] && [ -f "$BACKUP_DIR/$CONFIG_FILE" ]; then
     print_info "Preserving Configuration"
     OLD_TOKEN=$(read_json_val "$BACKUP_DIR/$CONFIG_FILE" "bot_token")
@@ -350,45 +514,53 @@ function install_process() {
     [ -z "$OLD_WS_PING_INTERVAL" ] && OLD_WS_PING_INTERVAL="20"
     [ -z "$OLD_WS_PING_TIMEOUT" ] && OLD_WS_PING_TIMEOUT="20"
   fi
-
+  
   # Fresh dir
   print_info "Preparing installation directory"
-  ensure_clean_install_dir
-
+  if ! ensure_clean_install_dir; then
+    print_error "Failed to prepare installation directory"
+    wait_enter
+    return 1
+  fi
+  
   # Deps + DB
   install_system_deps
-  setup_postgres
-
-  # GitHub only
+  if ! setup_postgres; then
+    print_error "PostgreSQL setup failed"
+    wait_enter
+    return 1
+  fi
+  
+  # GitHub clone
   print_info "Downloading Source Code (GitHub)"
   if ! clone_repo_to_install_dir; then
     print_error "Git clone failed. Check network/DNS/GitHub access."
     wait_enter
-    return
+    return 1
   fi
-  print_success "Source installed from GitHub."
-
+  print_success "Source installed from GitHub"
+  
   if ! verify_repo_files; then
     wait_enter
-    return
+    return 1
   fi
-
+  
   # Restore key
   if [ -f "/tmp/sonar_key.bak" ]; then
     print_info "Restoring Keys"
     mv /tmp/sonar_key.bak "$INSTALL_DIR/$KEY_FILE" >/dev/null 2>&1 || true
   fi
-
+  
   # venv + pip
   if ! setup_venv_and_pip; then
-    print_error "Python environment setup failed."
+    print_error "Python environment setup failed"
     wait_enter
-    return
+    return 1
   fi
-
+  
   # systemd
   write_service_file
-
+  
   # config
   if [ "$KEEP_CONFIG" = true ] && [ -n "${OLD_TOKEN:-}" ]; then
     local PORT_OK="$OLD_PORT"
@@ -398,37 +570,50 @@ function install_process() {
       warn_msg "Port $PORT_OK is in use. Using $NEW_PORT"
       PORT_OK="$NEW_PORT"
     fi
-
+    
     print_info "Restoring previous configuration"
-    echo "{\"bot_token\":\"$OLD_TOKEN\",\"admin_id\":\"$OLD_ADMIN\",\"agent_port\":$PORT_OK,\"ws_pool_max\":$OLD_WS_POOL,\"ws_ping_interval\":$OLD_WS_PING_INTERVAL,\"ws_ping_timeout\":$OLD_WS_PING_TIMEOUT}" > "$INSTALL_DIR/$CONFIG_FILE"
+    echo "{\"bot_token\":\"$OLD_TOKEN\",\"admin_id\":\"$OLD_ADMIN\",\"agent_port\":$PORT_OK,\"ws_pool_max\":$OLD_WS_POOL,\"ws_ping_interval\":$OLD_WS_PING_INTERVAL,\"ws_ping_timeout\":$OLD_WS_PING_TIMEOUT}" > "$INSTALL_DIR/$CONFIG_FILE" 2>/dev/null || {
+      print_error "Failed to write config file"
+      wait_enter
+      return 1
+    }
     update_settings_py "$OLD_ADMIN"
   else
-    configure_token_interactive
+    if ! configure_token_interactive; then
+      print_error "Configuration failed"
+      wait_enter
+      return 1
+    fi
   fi
-
+  
+  # Clean locks before starting
+  kill_zombie_processes
+  
   # start
   print_info "Starting Bot Service"
   systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+  sleep 3
   progress_bar 2
-
-  # verify ExecStart points to venv wrapper
+  
+  # verify ExecStart
   local ES
-  ES="$(systemctl show -p ExecStart "$SERVICE_NAME" | tr -d '\n' || true)"
+  ES="$(systemctl show -p ExecStart "$SERVICE_NAME" 2>/dev/null | tr -d '\n' || echo "")"
   if echo "$ES" | grep -q "$INSTALL_DIR/run_bot.sh"; then
-    print_success "Service ExecStart OK (run_bot.sh)."
+    print_success "Service ExecStart OK (run_bot.sh)"
   else
-    warn_msg "ExecStart is not run_bot.sh. Your unit may be overwritten elsewhere!"
-    echo "$ES"
+    warn_msg "ExecStart verification failed"
   fi
-
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
+  
+  # Check service status
+  sleep 2
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     print_success "Bot is ONLINE and Ready! 🦇"
     echo -e "   ${GRAY}Logs: journalctl -u $SERVICE_NAME -f${RESET}"
   else
-    print_error "Bot failed to start."
+    print_error "Bot failed to start"
     echo -e "${YELLOW}Check logs: journalctl -u $SERVICE_NAME -n 200 --no-pager${RESET}"
   fi
-
+  
   wait_enter
 }
 
@@ -438,62 +623,79 @@ function reset_postgres_database() {
   echo -e "${YELLOW}WARNING: This will DELETE ALL DATA in PostgreSQL (Drop & Recreate).${RESET}"
   echo -e "${GRAY}Database: ${DB_NAME} | User: ${DB_USER}${RESET}"
   echo ""
-  read -r -p "Type 'RESET' to confirm: " confirm
+  read -r -p "Type 'RESET' to confirm: " confirm || confirm=""
   if [[ "$confirm" != "RESET" ]]; then
-    print_info "Cancelled."
+    print_info "Cancelled"
     wait_enter
     return
   fi
-
+  
   systemctl start postgresql >/dev/null 2>&1 || true
-
+  sleep 2
+  
   print_info "Stopping Bot Service"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-
+  kill_zombie_processes
+  
   print_info "Terminating active DB connections"
   sudo -u postgres psql -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
-
+  
   print_info "Dropping Database"
   sudo -u postgres psql -d postgres -c "DROP DATABASE IF EXISTS ${DB_NAME};" >/dev/null 2>&1 || true
-
+  
   print_info "Recreating Database"
   setup_postgres
-
+  
   print_info "Starting Bot Service"
+  kill_zombie_processes
   systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-
-  print_success "Database Reset Completed."
+  
+  print_success "Database Reset Completed"
   wait_enter
 }
 
 function fix_db_and_dependencies() {
   print_title
   echo -e "${BOLD}🛠  FIX DATABASE / DEPENDENCIES${RESET}\n"
-
+  
   install_system_deps
   setup_postgres
-
+  
   if [ -d "$INSTALL_DIR" ]; then
     print_info "Rebuilding venv + pip packages"
     setup_venv_and_pip >/dev/null 2>&1 || true
     write_service_file >/dev/null 2>&1 || true
+    kill_zombie_processes
     systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
-
-  print_success "Fixes Applied."
+  
+  print_success "Fixes Applied"
   wait_enter
 }
 
 function full_restart() {
   print_title
   echo -e "${BOLD}♻️  FULL RESTART SEQUENCE${RESET}\n"
+  
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-  print_info "Terminating residual processes"
-  pkill -f "$INSTALL_DIR/bot.py" >/dev/null 2>&1 || true
+  sleep 2
+  
+  print_info "Terminating residual processes and cleaning locks"
+  kill_zombie_processes
+  
   sleep 1
   systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true
+  sleep 3
+  
   progress_bar 2
-  systemctl is-active --quiet "$SERVICE_NAME" && print_success "Service Restarted Successfully." || print_error "Service failed to restart."
+  
+  if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    print_success "Service Restarted Successfully"
+  else
+    print_error "Service failed to restart"
+    echo -e "${YELLOW}Check logs: journalctl -u $SERVICE_NAME -n 50 --no-pager${RESET}"
+  fi
+  
   wait_enter
 }
 
@@ -506,21 +708,32 @@ function view_logs() {
   echo "3) agent"
   echo "4) postgres"
   echo ""
-  read -r -p "Select log [1-4]: " LOPT
+  read -r -p "Select log [1-4]: " LOPT || LOPT="1"
   case "$LOPT" in
-    1) journalctl -u "$SERVICE_NAME" -f -n 80 ;;
-    2) journalctl -u "$API_SERVICE_NAME" -f -n 80 || { echo "api service not found"; sleep 2; } ;;
-    3) journalctl -u "$AGENT_SERVICE_NAME" -f -n 80 || { echo "agent service not found"; sleep 2; } ;;
-    4) journalctl -u postgresql -f -n 120 ;;
+    1) journalctl -u "$SERVICE_NAME" -f -n 80 2>/dev/null || { echo "Service not found"; sleep 2; } ;;
+    2) journalctl -u "$API_SERVICE_NAME" -f -n 80 2>/dev/null || { echo "api service not found"; sleep 2; } ;;
+    3) journalctl -u "$AGENT_SERVICE_NAME" -f -n 80 2>/dev/null || { echo "agent service not found"; sleep 2; } ;;
+    4) journalctl -u postgresql -f -n 120 2>/dev/null || { echo "postgresql service not found"; sleep 2; } ;;
     *) echo "Invalid"; sleep 1 ;;
   esac
 }
 
 function manual_config_menu() {
-  if [ ! -d "$INSTALL_DIR" ]; then print_error "Bot not installed."; wait_enter; return; fi
-  configure_token_interactive
+  if [ ! -d "$INSTALL_DIR" ]; then
+    print_error "Bot not installed"
+    wait_enter
+    return
+  fi
+  
+  if ! configure_token_interactive; then
+    print_error "Configuration failed"
+    wait_enter
+    return
+  fi
+  
+  kill_zombie_processes
   systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-  print_success "Bot Restarted with new config."
+  print_success "Bot Restarted with new config"
   wait_enter
 }
 
@@ -528,20 +741,24 @@ function uninstall_bot() {
   print_title
   echo -e "${RED}${BOLD}🗑️  UNINSTALLATION${RESET}\n"
   echo -e "${YELLOW}WARNING: This will delete the install directory and service unit!${RESET}"
-  read -r -p "Are you sure? (Type 'yes' to confirm): " confirm
+  read -r -p "Are you sure? (Type 'yes' to confirm): " confirm || confirm=""
   if [[ "$confirm" == "yes" ]]; then
     print_info "Stopping services..."
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    kill_zombie_processes
+    
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
-
+    
     print_info "Removing files..."
-    rm -rf "$INSTALL_DIR"
-
-    print_success "Uninstallation Complete."
+    rm -rf "$INSTALL_DIR" 2>/dev/null || true
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+    rm -f "/run/sonar-bot.lock" 2>/dev/null || true
+    
+    print_success "Uninstallation Complete"
   else
-    print_info "Cancelled."
+    print_info "Cancelled"
   fi
   wait_enter
 }
@@ -559,7 +776,7 @@ while true; do
   echo -e " ${GREEN}8)${RESET} 🧨 Reset Database (Drop & Recreate)"
   echo -e " ${RED}9) ❌ Exit${RESET}"
   echo ""
-  read -r -p " Select Option [1-9]: " OPTION
+  read -r -p " Select Option [1-9]: " OPTION || OPTION="9"
   case "$OPTION" in
     1) install_process false ;;
     2) install_process true  ;;
@@ -570,6 +787,6 @@ while true; do
     7) fix_db_and_dependencies ;;
     8) reset_postgres_database ;;
     9) clear; exit 0 ;;
-    *) echo "Invalid Option" ;;
+    *) echo "Invalid Option"; sleep 1 ;;
   esac
 done
