@@ -4,6 +4,7 @@
 # 🦇 SONAR RADAR ULTRA MONITOR - PROFESSIONAL INSTALLER (Server/Update/Reset)
 # - Keeps original menu/structure, but makes install 0->100 automated and stable.
 # - PostgreSQL only (no sqlite)
+# - Auto source: ZIP -> Git -> RAW (no questions)
 # ==============================================================================
 
 # --- Configuration ---
@@ -14,6 +15,9 @@ AGENT_SERVICE_NAME="sonar-agent"
 
 REPO_URL="https://github.com/Amirtn9/radar-sonar.git"
 RAW_URL="https://raw.githubusercontent.com/Amirtn9/radar-sonar/main"
+
+# ✅ Auto ZIP (put your project zip here to make install totally offline)
+DEFAULT_ZIP="/opt/radar_sonar_pro_2.9.zip"
 
 KEY_FILE="secret.key"
 CONFIG_FILE="sonar_config.json"
@@ -62,6 +66,11 @@ function print_success() {
 function print_error() {
     echo -e "${RED}${BOLD}❌ $1${RESET}"
     log_msg "ERROR: $1"
+}
+
+function warn_msg() {
+    echo -e "${YELLOW}${BOLD}⚠️  $1${RESET}"
+    log_msg "WARN: $1"
 }
 
 function print_info() {
@@ -174,52 +183,26 @@ function backup_install_dir() {
     echo ""
 }
 
-function restore_critical_files_from_backup() {
-    local bak="$1"
-    if [ -z "$bak" ] || [ ! -d "$bak" ]; then
-        return 0
-    fi
-
-    # Restore KEY_FILE
-    if [ -f "$bak/$KEY_FILE" ]; then
-        cp -a "$bak/$KEY_FILE" "$INSTALL_DIR/$KEY_FILE" 2>/dev/null || true
-        log_msg "Restored $KEY_FILE from backup."
-    fi
-
-    # Restore sonar_config.json (if user chose KEEP_CONFIG)
-    # (Handled later with JSON restore logic)
-}
-
-# --- Helper: Download/Extract source ---
 function ensure_clean_install_dir() {
     rm -rf "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR"
 }
 
+# --- Dependencies ---
 function install_system_deps() {
     print_info "Installing System Dependencies"
     apt-get update -y > /dev/null 2>&1 &
     show_loading $! "Updating repositories..."
 
-    # Minimal but complete dependencies for venv + postgres + builds
-    DEPS="python3 python3-pip python3-venv git curl unzip ca-certificates \
+    # ✅ add rsync (you use it) + iptables for firewall rule
+    DEPS="python3 python3-pip python3-venv git curl unzip ca-certificates rsync iptables \
 build-essential libssl-dev libffi-dev python3-dev \
 postgresql postgresql-contrib libpq-dev bc ufw"
     apt-get install -y $DEPS > /dev/null 2>&1 &
     show_loading $! "Installing packages..."
 }
 
-function download_source_menu() {
-    print_title
-    echo -e "${BOLD}📦 SOURCE INSTALL METHOD${RESET}\n"
-    echo "1) Local ZIP file (recommended)"
-    echo "2) Git clone (repo)"
-    echo "3) Raw download (fallback)"
-    echo ""
-    read -p "Select [1-3]: " SRC_OPT
-    echo "$SRC_OPT"
-}
-
+# --- Source install helpers ---
 function extract_zip_to_install_dir() {
     local zip_path="$1"
     if [ ! -f "$zip_path" ]; then
@@ -252,12 +235,55 @@ function raw_download_to_install_dir() {
 "logger_setup.py" "topics.py" "bot_logic.py" "states.py" "dispatcher.py" "api_server.py")
 
     for file in "${FILES[@]}"; do
-        curl -s -f -o "$INSTALL_DIR/$file" "$RAW_URL/$file" >/dev/null 2>&1 || {
+        if ! curl -s -f -o "$INSTALL_DIR/$file" "$RAW_URL/$file" >/dev/null 2>&1; then
+            # ✅ api_server.py is optional in some repos -> do not fail installation
+            if [[ "$file" == "api_server.py" ]]; then
+                warn_msg "api_server.py not found in RAW repo - skipping."
+                continue
+            fi
             print_error "Failed to download: $file"
             return 1
-        }
+        fi
     done
     return 0
+}
+
+function install_source_auto() {
+    print_info "Downloading Source Code (AUTO: ZIP -> Git -> RAW)"
+
+    # 1) ZIP (Best)
+    if [ -f "$DEFAULT_ZIP" ]; then
+        print_info "Found local ZIP: $DEFAULT_ZIP"
+        if extract_zip_to_install_dir "$DEFAULT_ZIP"; then
+            print_success "Source installed from ZIP."
+            return 0
+        else
+            print_error "ZIP extraction failed."
+            return 1
+        fi
+    fi
+
+    warn_msg "ZIP not found at $DEFAULT_ZIP"
+
+    # 2) Git clone
+    print_info "Trying Git clone..."
+    if git_clone_to_install_dir; then
+        print_success "Source installed from Git."
+        return 0
+    fi
+
+    warn_msg "Git clone failed."
+
+    # 3) RAW fallback
+    print_info "Trying RAW fallback..."
+    if raw_download_to_install_dir; then
+        print_success "Source installed from RAW."
+        return 0
+    fi
+
+    print_error "RAW download failed."
+    echo -e "${YELLOW}Fix: Put your project ZIP at: $DEFAULT_ZIP${RESET}"
+    return 1
 }
 
 # --- Python venv & pip ---
@@ -275,6 +301,8 @@ function setup_venv_and_pip() {
         show_loading $! "Pip installing modules..."
     else
         print_error "requirements.txt not found!"
+        deactivate >/dev/null 2>&1 || true
+        return 1
     fi
 
     # Enforce critical packages (requests/psycopg2/ptb job-queue)
@@ -284,6 +312,7 @@ function setup_venv_and_pip() {
     # Quick import healthcheck
     python -c "import requests; import telegram; import psycopg2; print('OK')" >/dev/null 2>&1 || {
         print_error "Python import healthcheck failed (requests/telegram/psycopg2)."
+        deactivate >/dev/null 2>&1 || true
         return 1
     }
 
@@ -341,15 +370,18 @@ function setup_postgres() {
     systemctl start postgresql >/dev/null 2>&1 || true
     systemctl enable postgresql >/dev/null 2>&1 || true
 
+    # ✅ avoid "could not change directory to /root" noise
+    sudo -u postgres bash -lc "cd /tmp && psql -tAc \"SELECT 1;\" " >/dev/null 2>&1 || true
+
     # Create user if not exists
-    sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';" >/dev/null 2>&1
+    sudo -u postgres bash -lc "cd /tmp && psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'\" " | grep -q 1 || \
+    sudo -u postgres bash -lc "cd /tmp && psql -c \"CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';\" " >/dev/null 2>&1
 
     # Create DB if not exists
-    sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 || \
-    sudo -u postgres psql -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;" >/dev/null 2>&1
+    sudo -u postgres bash -lc "cd /tmp && psql -tAc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\" " | grep -q 1 || \
+    sudo -u postgres bash -lc "cd /tmp && psql -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER;\" " >/dev/null 2>&1
 
-    sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;" >/dev/null 2>&1
+    sudo -u postgres bash -lc "cd /tmp && psql -c \"GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;\" " >/dev/null 2>&1
 
     print_success "PostgreSQL Database Ready."
 }
@@ -377,10 +409,10 @@ function reset_postgres_database() {
     systemctl stop $SERVICE_NAME >/dev/null 2>&1 || true
 
     print_info "Terminating active DB connections"
-    sudo -u postgres psql -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    sudo -u postgres bash -lc "cd /tmp && psql -c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${DB_NAME}' AND pid <> pg_backend_pid();\" " >/dev/null 2>&1 || true
 
     print_info "Dropping Database"
-    sudo -u postgres psql -c "DROP DATABASE IF EXISTS ${DB_NAME};" >/dev/null 2>&1 || true
+    sudo -u postgres bash -lc "cd /tmp && psql -c \"DROP DATABASE IF EXISTS ${DB_NAME};\" " >/dev/null 2>&1 || true
 
     print_info "Recreating Database"
     setup_postgres
@@ -453,33 +485,10 @@ function install_process() {
     # Configure Database
     setup_postgres
 
-    # 5. Download Source
-    print_info "Downloading Source Code"
-    SRC_OPT="$(download_source_menu)"
-
-    if [ "$SRC_OPT" = "1" ]; then
-        read -p "Enter local ZIP path (example: /opt/radar_sonar_pro_2.9.zip): " ZIP_PATH
-        if ! extract_zip_to_install_dir "$ZIP_PATH"; then
-            print_error "ZIP install failed."
-            wait_enter
-            return
-        fi
-        print_success "Source installed from ZIP."
-    elif [ "$SRC_OPT" = "2" ]; then
-        if ! git_clone_to_install_dir; then
-            print_error "Git clone failed."
-            wait_enter
-            return
-        fi
-        print_success "Source installed from Git."
-    else
-        print_info "Raw download fallback..."
-        if ! raw_download_to_install_dir; then
-            print_error "Raw download failed."
-            wait_enter
-            return
-        fi
-        print_success "Source installed from RAW."
+    # 5. Download Source (AUTO, no questions)
+    if ! install_source_auto; then
+        wait_enter
+        return
     fi
 
     # 6. Restore Keys
@@ -500,12 +509,11 @@ function install_process() {
 
     # 9. Handle Configuration
     if [ "$KEEP_CONFIG" = true ] && [ -n "$OLD_TOKEN" ]; then
-        # Port check & suggestion if occupied
         local PORT_OK="$OLD_PORT"
         if port_in_use "$PORT_OK"; then
             local NEW_PORT
             NEW_PORT="$(find_free_port "$PORT_OK")"
-            print_info "Port $PORT_OK is in use. Suggested free port: $NEW_PORT"
+            warn_msg "Port $PORT_OK is in use. Suggested free port: $NEW_PORT"
             PORT_OK="$NEW_PORT"
         fi
 
@@ -530,16 +538,11 @@ function install_process() {
         echo -e "${YELLOW}Check logs: journalctl -u $SERVICE_NAME -f${RESET}"
     fi
 
-    # Health: ensure systemd ExecStart uses venv wrapper
+    # Health: ensure systemd ExecStart uses wrapper
     systemctl show -p ExecStart $SERVICE_NAME | grep -q "$INSTALL_DIR/run_bot.sh" >/dev/null 2>&1 || \
         warn_msg "Warning: ExecStart does not point to run_bot.sh"
 
     wait_enter
-}
-
-function warn_msg() {
-    echo -e "${YELLOW}${BOLD}⚠️  $1${RESET}"
-    log_msg "WARN: $1"
 }
 
 function configure_token_interactive() {
@@ -556,7 +559,6 @@ function configure_token_interactive() {
     read -p ">> " PORT_INPUT
     PORT_INPUT=${PORT_INPUT:-8080}
 
-    # Suggest free port if in use
     if port_in_use "$PORT_INPUT"; then
         local NEW_PORT
         NEW_PORT="$(find_free_port "$PORT_INPUT")"
@@ -635,7 +637,6 @@ function uninstall_bot() {
     wait_enter
 }
 
-# Option 7: Fix DB / Dependencies (real fix, not apt-get install -f only)
 function fix_db_and_dependencies() {
     print_title
     echo -e "${BOLD}🛠  FIX DATABASE / DEPENDENCIES${RESET}\n"
