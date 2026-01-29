@@ -19,7 +19,10 @@
 
 ## ⚡ نصب سریع با یک دستور
 
-curl -sL https://raw.githubusercontent.com/Amirtn9/Radar-Sonar/main/install.sh | bash
+wget https://raw.githubusercontent.com/Amirtn9/Radar-Sonar/main/install.sh
+chmod +x install.sh
+./install.sh
+
 
 یا بعد از کلون:
 
